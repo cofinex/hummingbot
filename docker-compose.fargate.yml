@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  hummingbot:
+    build:
+      context: .
+      dockerfile: Dockerfile.fargate
+    environment:
+      - HEADLESS_MODE=true
+      - MQTT_HOST=${MQTT_HOST:-localhost}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USERNAME=${MQTT_USERNAME:-hummingbot}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - MQTT_NAMESPACE=${MQTT_NAMESPACE:-hbot}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - EFS_MOUNT_PATH=${EFS_MOUNT_PATH:-/mnt/efs}
+    volumes:
+      - hummingbot-data:/app/data
+      - hummingbot-logs:/app/logs
+      - hummingbot-conf:/app/conf
+    ports:
+      - "8080:8080"  # Health check port
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # MQTT Broker (for local testing)
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-logs:/mosquitto/log
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    restart: unless-stopped
+
+  # MQTT Monitor (for testing)
+  mqtt-monitor:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./monitoring:/app
+    command: python monitor.py
+    environment:
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+volumes:
+  hummingbot-data:
+  hummingbot-logs:
+  hummingbot-conf:
+  mosquitto-data:
+  mosquitto-logs:

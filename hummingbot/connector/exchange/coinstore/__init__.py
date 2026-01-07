@@ -1,0 +1,1 @@
+# CoinStore Exchange Connector

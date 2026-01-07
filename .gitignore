@@ -84,6 +84,16 @@ coverage.xml
 *.crt
 *.log
 
+# Private keys and sensitive files
+*.ppk
+*_key.txt
+*_private.*
+backtesting/*.ppk
+backtesting/*_key.txt
+backtesting/*_private.*
+backtesting/yoplex
+backtesting/zepfusion-digital-ocean
+
 # Debug console
 .debug_console_ssh_host_key
 

@@ -14,8 +14,26 @@ from hummingbot.user.user_balances import UserBalances
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
 
-OPTIONS = {cs.name for cs in AllConnectorSettings.get_connector_settings().values()
-           if not cs.use_ethereum_wallet and not cs.uses_gateway_generic_connector() if cs.name != "probit_kr"}
+
+def get_connect_options():
+    """Get the list of available connectors for the connect command.
+    This is a function to ensure it's evaluated after paper trade settings are initialized."""
+    return {cs.name for cs in AllConnectorSettings.get_connector_settings().values()
+            if not cs.use_ethereum_wallet and not cs.uses_gateway_generic_connector() if cs.name != "probit_kr"}
+
+# For backward compatibility with parser, create OPTIONS as a callable that returns the set
+# The parser uses this for choices validation
+
+
+class ConnectOptions:
+    def __contains__(self, item):
+        return item in get_connect_options()
+
+    def __iter__(self):
+        return iter(get_connect_options())
+
+
+OPTIONS = ConnectOptions()
 
 
 class ConnectCommand:
@@ -88,7 +106,7 @@ class ConnectCommand:
         except asyncio.TimeoutError:
             self.notify("\nA network error prevented the connection table to populate. See logs for more details.")
             raise
-        for option in sorted(OPTIONS):
+        for option in sorted(get_connect_options()):
             keys_added = "No"
             keys_confirmed = "No"
             api_keys = (

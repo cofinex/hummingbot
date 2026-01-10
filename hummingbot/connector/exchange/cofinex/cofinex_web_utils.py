@@ -17,28 +17,36 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN, rest_api_base_url: Optional[str] = None) -> str:
     """
     Creates a full URL for provided REST endpoint
 
     :param path_url: a public REST endpoint
     :param domain: the domain to connect to ("main" or "testnet"). The default value is "main"
+    :param rest_api_base_url: Optional override for REST API base URL (for local testing)
 
     :return: the full URL to the endpoint
     """
-    return CONSTANTS.BASE_PATH_URL[domain] + path_url
+    # Market data endpoints (trading pairs, order book) use MARKET_DATA_BASE_URL
+    # Trade engine endpoints use BASE_PATH_URL (or configured rest_api_base_url)
+    if path_url.startswith("/spot/v1/"):
+        return CONSTANTS.MARKET_DATA_BASE_URL[domain] + path_url
+    # Use configured base URL if provided, otherwise use default from constants
+    base_url = rest_api_base_url or CONSTANTS.BASE_PATH_URL.get(domain, CONSTANTS.BASE_PATH_URL["main"])
+    return base_url + path_url
 
 
-def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN, rest_api_base_url: Optional[str] = None) -> str:
     """
     Creates a full URL for provided REST endpoint
 
     :param path_url: a private REST endpoint
     :param domain: the domain to connect to ("main" or "testnet"). The default value is "main"
+    :param rest_api_base_url: Optional override for REST API base URL (for local testing)
 
     :return: the full URL to the endpoint
     """
-    return public_rest_url(path_url=path_url, domain=domain)
+    return public_rest_url(path_url=path_url, domain=domain, rest_api_base_url=rest_api_base_url)
 
 
 def build_api_factory(
@@ -47,6 +55,7 @@ def build_api_factory(
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         time_provider: Optional[Callable] = None,
         auth: Optional[AuthBase] = None,
+        rest_api_base_url: Optional[str] = None,
 ) -> WebAssistantsFactory:
     """
     Creates a WebAssistantsFactory configured for Cofinex API
@@ -127,7 +136,7 @@ async def get_current_server_time(
                 server_time = response
             return float(server_time) / 1000.0  # Convert to seconds if in milliseconds
         return float(response) / 1000.0
-    except Exception as e:
+    except Exception:
         # Fallback to local time if server time unavailable
         import time
         return time.time()

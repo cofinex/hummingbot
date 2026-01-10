@@ -9,27 +9,41 @@ TODO: Implement all the methods based on Cofinex API documentation
 """
 
 import asyncio
-import logging
+import os
+import sys
+import threading
 import time
+import traceback
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from bidict import bidict
+
+from hummingbot.connector.exchange.cofinex import cofinex_constants as CONSTANTS, cofinex_web_utils as web_utils
+from hummingbot.connector.exchange.cofinex.cofinex_api_order_book_data_source import CofinexAPIOrderBookDataSource
 from hummingbot.connector.exchange.cofinex.cofinex_auth import CofinexAuth
-from hummingbot.connector.exchange.cofinex.cofinex_constants import *
-from hummingbot.connector.exchange_base import ExchangeBase
+from hummingbot.connector.exchange_py_base import ExchangePyBase
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_book import OrderBook
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
+from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
-    from hummingbot.client.config.client_config_map import ClientConfigMap
+    pass
 
 
-class CofinexExchange(ExchangeBase):
+class CofinexExchange(ExchangePyBase):
     """
     Cofinex Exchange Connector
 
@@ -44,36 +58,144 @@ class CofinexExchange(ExchangeBase):
     TODO: Implement all methods based on Cofinex API documentation
     """
 
-    def __init__(self, client_config_map: "ClientConfigMap", trading_pairs: List[str], trading_required: bool = True):
+    web_utils = web_utils
+
+    def __init__(
+        self,
+        trading_pairs: List[str],
+        trading_required: bool = True,
+        cofinex_username: Optional[str] = None,
+        cofinex_password: Optional[str] = None,
+        domain: str = CONSTANTS.DEFAULT_DOMAIN,
+        balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+        rate_limits_share_pct: Decimal = Decimal("100"),
+        ws_prefix: Optional[str] = None,
+    ):
         """
         Initialize Cofinex exchange connector
 
         Args:
-            client_config_map: Hummingbot client configuration
             trading_pairs: List of trading pairs to track
             trading_required: Whether trading functionality is required
+            cofinex_username: Cofinex username (email) - optional for non-trading instances
+            cofinex_password: Cofinex password - optional for non-trading instances
+            domain: Domain to connect to ("main" or "testnet")
+            balance_asset_limit: Optional balance limits
+            rate_limits_share_pct: Rate limit share percentage
+            ws_prefix: Optional WebSocket namespace prefix for local testing (e.g., "dev:santosh")
         """
-        super().__init__(client_config_map)
-        self.trading_pairs = trading_pairs
-        self.trading_required = trading_required
+        # Set instance variables before calling super (matching Binance pattern)
+        self._trading_pairs = trading_pairs
+        self._trading_required = trading_required
+        self._domain = domain
+        # Handle empty strings from config (convert to None)
+        self._cofinex_username = cofinex_username if cofinex_username and cofinex_username.strip() else None
+        self._cofinex_password = cofinex_password if cofinex_password and cofinex_password.strip() else None
+
+        # Handle WebSocket prefix and REST API base URL
+        # Priority: 1) Parameter, 2) Config map, 3) Environment variable
+        from hummingbot.client.config.security import Security
+
+        # Try to read from config map (for both "cofinex" and "cofinex_paper_trade", config is under "cofinex")
+        connector_config = Security.decrypted_value("cofinex")
+
+        if ws_prefix is None:
+            if connector_config is not None:
+                ws_prefix = getattr(connector_config.hb_config, "cofinex_ws_prefix", None)
+                if ws_prefix:
+                    ws_prefix = ws_prefix.strip() if isinstance(ws_prefix, str) else None
+                    if not ws_prefix:
+                        ws_prefix = None
+            # Fallback to environment variable
+            if ws_prefix is None:
+                ws_prefix = os.getenv("COFINEX_WS_PREFIX") or os.getenv("DEV_NAMESPACE")
+                if ws_prefix:
+                    ws_prefix = ws_prefix.strip()
+                    if not ws_prefix:
+                        ws_prefix = None
+
+        self._ws_prefix = ws_prefix  # Store it (can be None)
+
+        # Handle REST API base URL
+        # Priority: 1) Config map, 2) Environment variable, 3) Default production URL
+        rest_api_base_url = None
+        if connector_config is not None:
+            rest_api_base_url = getattr(connector_config.hb_config, "cofinex_rest_api_base_url", None)
+            if rest_api_base_url:
+                rest_api_base_url = rest_api_base_url.strip() if isinstance(rest_api_base_url, str) else None
+                if not rest_api_base_url:
+                    rest_api_base_url = None
+        # Fallback to environment variable
+        if rest_api_base_url is None:
+            rest_api_base_url = os.getenv("COFINEX_REST_API_BASE_URL")
+            if rest_api_base_url:
+                rest_api_base_url = rest_api_base_url.strip()
+                if not rest_api_base_url:
+                    rest_api_base_url = None
+        # Use default production URL if not configured
+        if rest_api_base_url is None:
+            rest_api_base_url = CONSTANTS.BASE_PATH_URL.get(domain, CONSTANTS.BASE_PATH_URL["main"])
+
+        self._rest_api_base_url = rest_api_base_url
+
+        # Call super with both parameters (ExchangePyBase pattern)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
+
+        # CRITICAL: If we have trading pairs, ensure symbol map will be initialized
+        # The trading_pair_symbol_map() property will call _initialize_trading_pair_symbol_map()
+        # when accessed, but we need to make sure it's called with the correct trading pairs
+        if self._trading_pairs and len(self._trading_pairs) > 0:
+            import sys
+            print(f"[COFINEX] __init__: Trading pairs set: {self._trading_pairs}", file=sys.stderr, flush=True)
+            self.logger().info(f"Trading pairs configured in __init__: {self._trading_pairs}")
+            # Reset symbol map to None so it will be re-initialized when accessed
+            self._trading_pair_symbol_map = None
+
+            # Force immediate initialization if we have trading pairs
+            # This ensures the per-pair API is used instead of waiting for property access
+            from hummingbot.core.utils.async_utils import safe_ensure_future
+            try:
+                # Schedule initialization as a background task
+                # This will use the per-pair endpoint since self._trading_pairs is now set
+                safe_ensure_future(self._initialize_trading_pair_symbol_map())
+                print("[COFINEX] __init__: Scheduled symbol map initialization task", file=sys.stderr, flush=True)
+                self.logger().info("Scheduled symbol map initialization with per-pair API")
+            except Exception as e:
+                print(f"[COFINEX] __init__: Error scheduling initialization: {e}", file=sys.stderr, flush=True)
+                self.logger().warning(f"Could not schedule symbol map initialization: {e}")
+
+        # CRITICAL: Verify method resolution works
+        import sys
+        print(f"[COFINEX] __init__: type(self) = {type(self)}", file=sys.stderr, flush=True)
+        print(f"[COFINEX] __init__: hasattr(self, 'start_network') = {hasattr(self, 'start_network')}", file=sys.stderr, flush=True)
+        print(f"[COFINEX] __init__: self.start_network = {self.start_network}", file=sys.stderr, flush=True)
+        print(f"[COFINEX] __init__: self.start_network.__qualname__ = {getattr(self.start_network, '__qualname__', 'N/A')}", file=sys.stderr, flush=True)
 
         # Authentication
         self._auth: Optional[CofinexAuth] = None
 
         # Data storage
         self._order_books: Dict[str, OrderBook] = {}
-        self._trading_rules: Dict[str, Any] = {}
+        self._trading_rules: Dict[str, TradingRule] = {}
         self._in_flight_orders: Dict[str, LimitOrder] = {}
         self._account_balances: Dict[str, Decimal] = {}
 
         # Network tasks
         self._status_polling_task: Optional[asyncio.Task] = None
         self._user_stream_tracker: Optional[Any] = None
-        self._order_book_tracker: Optional[Any] = None
+        self._order_book_tracker: Optional[OrderBookTracker] = None
+        self._web_assistants_factory = None
 
         # Rate limiting
         self._last_request_time = 0
         self._request_count = 0
+
+        # Event loop watchdog
+        self._loop_watchdog_task: Optional[asyncio.Task] = None
+        self._loop_watchdog_thread: Optional[threading.Thread] = None
+        self._loop_watchdog_stop: Optional[threading.Event] = None
+        self._loop_heartbeat: float = 0.0
+        self._loop_watchdog_dumped: bool = False
 
         self.logger().info("Cofinex connector initialized")
 
@@ -87,29 +209,383 @@ class CofinexExchange(ExchangeBase):
         return "cofinex"
 
     @property
+    def authenticator(self):
+        """Return authenticator instance"""
+        # For paper trading, return None
+        if not self._trading_required:
+            return None
+        # If we have credentials, create auth instance
+        if self._cofinex_username and self._cofinex_password:
+            # Note: api_factory will be set later in start_network
+            # For now, create auth without api_factory (it will be set later)
+            return CofinexAuth(
+                username=self._cofinex_username,
+                password=self._cofinex_password,
+            )
+        return None
+
+    @property
+    def rate_limits_rules(self):
+        """Return rate limits rules"""
+        return CONSTANTS.RATE_LIMITS
+
+    @property
+    def domain(self):
+        """Return domain"""
+        return self._domain
+
+    @property
+    def client_order_id_max_length(self):
+        """Return max order ID length"""
+        return CONSTANTS.MAX_ORDER_ID_LEN
+
+    @property
+    def client_order_id_prefix(self):
+        """Return order ID prefix"""
+        return CONSTANTS.HBOT_ORDER_ID_PREFIX
+
+    @property
+    def trading_rules_request_path(self):
+        """Return trading rules request path"""
+        return CONSTANTS.TRADING_PAIRS_PATH_URL
+
+    @property
+    def trading_pairs_request_path(self):
+        """Return trading pairs request path"""
+        return CONSTANTS.TRADING_PAIRS_PATH_URL
+
+    @property
+    def check_network_request_path(self):
+        """Return network check request path"""
+        return CONSTANTS.SERVER_TIME_PATH_URL
+
+    @property
+    def is_cancel_request_in_exchange_synchronous(self) -> bool:
+        """Return whether cancel requests are synchronous"""
+        return True
+
+    @property
+    def is_trading_required(self) -> bool:
+        """Return whether trading is required"""
+        return self._trading_required
+
+    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+        """Create web assistants factory"""
+        return web_utils.build_api_factory(
+            throttler=self._throttler,
+            time_synchronizer=self._time_synchronizer,
+            domain=self._domain,
+            auth=self.authenticator,
+            rest_api_base_url=getattr(self, "_rest_api_base_url", None),
+        )
+
+    def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+        """Create order book data source"""
+        return CofinexAPIOrderBookDataSource(
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            domain=self._domain,
+            ws_prefix=self._ws_prefix,
+        )
+
+    def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        """Create user stream data source"""
+        from hummingbot.connector.exchange.cofinex.cofinex_api_user_stream_data_source import (
+            CofinexAPIUserStreamDataSource,
+        )
+        return CofinexAPIUserStreamDataSource(
+            auth=self.authenticator,
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            domain=self._domain,
+        )
+
+    # =============================================================================
+    # REQUIRED ABSTRACT METHODS (stub implementations for now)
+    # =============================================================================
+
+    def supported_order_types(self):
+        """Return supported order types"""
+        return [OrderType.LIMIT, OrderType.MARKET]
+
+    def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
+        """Check if exception is related to time synchronizer"""
+        # TODO: Implement based on Cofinex error codes
+        return False
+
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        """Check if exception indicates order not found during status update"""
+        # TODO: Implement based on Cofinex error codes
+        return False
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        """Check if exception indicates order not found during cancellation"""
+        # TODO: Implement based on Cofinex error codes
+        return False
+
+    def _get_fee(self,
+                 base_currency: str,
+                 quote_currency: str,
+                 order_type: OrderType,
+                 order_side: TradeType,
+                 amount: Decimal,
+                 price: Decimal = None,
+                 is_maker: Optional[bool] = None) -> TradeFeeBase:
+        """Calculate trading fee"""
+        from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee
+        is_maker = order_type is OrderType.LIMIT_MAKER if is_maker is None else is_maker
+        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
+
+    async def _request_order_status(self, tracked_order) -> Any:
+        """Request order status from exchange"""
+        # TODO: Implement order status request
+        raise NotImplementedError("Order status request not yet implemented")
+
+    async def _all_trade_updates_for_order(self, order) -> List[Any]:
+        """Get all trade updates for an order"""
+        # TODO: Implement trade updates retrieval
+        return []
+
+    async def _update_balances(self):
+        """Update account balances from exchange"""
+        # TODO: Implement balance update
+        pass
+
+    async def _update_trading_fees(self):
+        """Update trading fees from exchange"""
+        # TODO: Implement fee update
+        pass
+
+    async def _user_stream_event_listener(self):
+        """Listen to user stream events"""
+        # TODO: Implement user stream event listener
+        async for event_message in self._iter_user_event_queue():
+            try:
+                # Process events here
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
+                await self._sleep(5.0)
+
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+        """Initialize trading pair symbol map from exchange info"""
+        # This is already implemented in _initialize_trading_pair_symbol_map
+        # But we need this method for ExchangePyBase compatibility
+        mapping = bidict()
+        pairs = exchange_info.get("data", {}).get("pairs", [])
+        for pair_data in pairs:
+            symbol = pair_data.get("symbol", "").upper()
+            data = pair_data.get("data", {})
+            base_coin = data.get("baseCoin", "").upper()
+            quote_coin = data.get("quoteCoin", "").upper()
+            if not symbol or not base_coin or not quote_coin:
+                continue
+            hb_trading_pair = combine_to_hb_trading_pair(base=base_coin, quote=quote_coin)
+            mapping[symbol] = hb_trading_pair
+        self._set_trading_pair_symbol_map(mapping)
+
+    async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
+        """
+        Format trading rules from Cofinex API response.
+
+        Expected response format:
+        {
+            "code": "200",
+            "msg": "success",
+            "data": {
+                "total": 725,
+                "pairs": [
+                    {
+                        "symbol": "MASUSDT",
+                        "exchange": "bitget",
+                        "data": {
+                            "symbol": "MASUSDT",
+                            "baseCoin": "MAS",
+                            "quoteCoin": "USDT",
+                            "minTradeAmount": "0",
+                            "maxTradeAmount": "900000000000000000000",
+                            "takerFeeRate": "0.001",
+                            "makerFeeRate": "0.001",
+                            "status": "online",
+                            "minTradeUSDT": "1",
+                            "pricePrecision": "5",
+                            "quantityPrecision": "2",
+                            "quotePrecision": "7",
+                            ...
+                        }
+                    },
+                    ...
+                ]
+            }
+        }
+        """
+        trading_rules = []
+
+        # Handle Cofinex API response format
+        if exchange_info_dict.get("code") != "200":
+            error_msg = exchange_info_dict.get("msg", "Unknown error")
+            self.logger().error(f"Trading pairs API returned error: {error_msg}")
+            return trading_rules
+
+        pairs = exchange_info_dict.get("data", {}).get("pairs", [])
+
+        for pair_data in pairs:
+            try:
+                symbol = pair_data.get("symbol", "").upper()
+                data = pair_data.get("data", {})
+
+                if not symbol or not data:
+                    continue
+
+                base_coin = data.get("baseCoin", "").upper()
+                quote_coin = data.get("quoteCoin", "").upper()
+
+                if not base_coin or not quote_coin:
+                    continue
+
+                hb_trading_pair = combine_to_hb_trading_pair(base=base_coin, quote=quote_coin)
+
+                min_order_size = Decimal(str(data.get("minTradeAmount", "0")))
+                max_order_size = Decimal(str(data.get("maxTradeAmount", "900000000000000000000")))
+                price_precision = int(data.get("pricePrecision", 0))
+                quantity_precision = int(data.get("quantityPrecision", 0))
+                quote_precision = int(data.get("quotePrecision", 0))
+                min_notional_size = Decimal(str(data.get("minTradeUSDT", "0")))
+
+                min_price_increment = Decimal("10") ** Decimal(-price_precision) if price_precision > 0 else Decimal("0")
+                min_base_amount_increment = Decimal("10") ** Decimal(-quantity_precision) if quantity_precision > 0 else Decimal("0")
+                min_quote_amount_increment = Decimal("10") ** Decimal(-quote_precision) if quote_precision > 0 else Decimal("0")
+
+                supports_limit_orders = data.get("status") == "online"
+                supports_market_orders = data.get("status") == "online"
+
+                trading_rules.append(TradingRule(
+                    trading_pair=hb_trading_pair,
+                    min_order_size=min_order_size,
+                    max_order_size=max_order_size,
+                    min_price_increment=min_price_increment,
+                    min_base_amount_increment=min_base_amount_increment,
+                    min_quote_amount_increment=min_quote_amount_increment,
+                    min_notional_size=min_notional_size,
+                    supports_limit_orders=supports_limit_orders,
+                    supports_market_orders=supports_market_orders,
+                ))
+
+                # Log the parsed precision values
+                self.logger().info(
+                    f"Parsed trading rule for {hb_trading_pair}: "
+                    f"pricePrecision={price_precision} → min_price_increment={min_price_increment}, "
+                    f"quantityPrecision={quantity_precision} → min_base_amount_increment={min_base_amount_increment}, "
+                    f"quotePrecision={quote_precision} → min_quote_amount_increment={min_quote_amount_increment}"
+                )
+            except Exception:
+                self.logger().exception(f"Error parsing trading pair rule {pair_data.get('symbol', 'unknown')}. Skipping.")
+                continue
+
+        return trading_rules
+
+    async def _update_trading_rules(self):
+        """
+        Update trading rules from Cofinex API.
+
+        Override to use per-pair endpoint instead of bulk endpoint.
+        This only fetches trading rules for configured trading pairs.
+        """
+        import sys
+        print(f"[COFINEX] _update_trading_rules called. trading_pairs={self._trading_pairs}", file=sys.stderr, flush=True)
+        self.logger().info(f"Updating trading rules for {len(self._trading_pairs)} configured pairs: {self._trading_pairs}")
+
+        try:
+            # Check if we have configured trading pairs
+            if not self._trading_pairs or len(self._trading_pairs) == 0:
+                # No configured pairs - create default trading rules for paper trading
+                self.logger().warning("No trading pairs configured - creating default trading rules for paper trading")
+                self._trading_rules.clear()
+                # For paper trading, we can continue without trading rules
+                # The order validation will use defaults
+                return
+
+            # Use per-pair endpoint to fetch only configured pairs
+            pairs_data = await self._fetch_trading_pairs_for_configured_pairs()
+
+            if not pairs_data:
+                self.logger().warning("No trading pairs data fetched - creating default trading rules")
+                self._trading_rules.clear()
+                return
+
+            # Build exchange_info dict in the format expected by _format_trading_rules
+            # Convert list of pairs to the format expected by _format_trading_rules
+            exchange_info = {
+                "code": "200",
+                "msg": "success",
+                "data": {
+                    "total": len(pairs_data),
+                    "pairs": pairs_data
+                }
+            }
+
+            # Format trading rules using existing method
+            trading_rules_list = await self._format_trading_rules(exchange_info)
+
+            # Update trading rules dict
+            self._trading_rules.clear()
+            for trading_rule in trading_rules_list:
+                self._trading_rules[trading_rule.trading_pair] = trading_rule
+                # Log each trading rule that was loaded
+                self.logger().info(
+                    f"Loaded trading rule for {trading_rule.trading_pair}: "
+                    f"min_price_increment={trading_rule.min_price_increment}, "
+                    f"min_base_amount_increment={trading_rule.min_base_amount_increment}, "
+                    f"min_quote_amount_increment={trading_rule.min_quote_amount_increment}, "
+                    f"min_order_size={trading_rule.min_order_size}, "
+                    f"min_notional_size={trading_rule.min_notional_size}"
+                )
+
+            self.logger().info(f"Updated trading rules. Total rules: {len(self._trading_rules)}")
+            # Log all trading pair keys
+            if self._trading_rules:
+                self.logger().info(f"Trading rules loaded for pairs: {list(self._trading_rules.keys())}")
+            print(f"[COFINEX] _update_trading_rules complete: {len(self._trading_rules)} rules", file=sys.stderr, flush=True)
+
+        except Exception as e:
+            self.logger().error(f"Error updating trading rules: {e}", exc_info=True)
+            # For paper trading, don't raise - create default rules
+            if not self.is_trading_required:
+                self.logger().warning("Paper trading mode: Continuing with empty trading rules")
+                self._trading_rules.clear()
+            else:
+                raise
+
+    @property
+    def trading_pairs(self) -> List[str]:
+        """Get list of trading pairs"""
+        return self._trading_pairs if hasattr(self, '_trading_pairs') else []
+
+    @property
     def order_books(self) -> Dict[str, OrderBook]:
         """Get all order books"""
+        if self._order_book_tracker:
+            return self._order_book_tracker.order_books
         return self._order_books
 
     @property
-    def trading_rules(self) -> Dict[str, Any]:
+    def ready(self) -> bool:
+        """Override to add logging, while keeping base readiness logic."""
+        result = super().ready
+        status = self.status_dict
+        import sys
+        print(f"[COFINEX] ready property called: {result}, status_dict: {status}", file=sys.stderr, flush=True)
+        self.logger().info(f"Connector ready status: {result}, details: {status}")
+        return result
+
+    @property
+    def trading_rules(self) -> Dict[str, TradingRule]:
         """Get trading rules for all pairs"""
         return self._trading_rules
-
-    @property
-    def status_dict(self) -> Dict[str, bool]:
-        """Get connection status dictionary"""
-        return {
-            "order_books_initialized": len(self._order_books) > 0,
-            "account_balance": self._auth is not None,
-            "trading_required": self.trading_required,
-            "trading_enabled": self.trading_required and self._auth is not None
-        }
-
-    @property
-    def ready(self) -> bool:
-        """Check if connector is ready for trading"""
-        return all(self.status_dict.values())
 
     # =============================================================================
     # NETWORK MANAGEMENT
@@ -119,69 +595,230 @@ class CofinexExchange(ExchangeBase):
         """
         Start the exchange connector
 
-        TODO: Implement proper startup sequence:
-        1. Initialize authentication
-        2. Validate credentials
-        3. Start order book tracking
-        4. Start user stream (if trading required)
-        5. Start status polling
+        Initialization sequence:
+        1. Initialize trading pair symbol map (needed for all operations)
+        2. Update trading rules (needed for order validation)
+        3. Initialize authentication (if trading required)
+        4. Call parent start_network() to start order book tracker and polling tasks
         """
+        # CRITICAL: Print immediately - this MUST be the first line
+        # Write to file FIRST - even before print
+        try:
+            with open("/tmp/cofinex_start_network.txt", "a") as f:
+                f.write(f"\n{'=' * 80}\n")
+                f.write(f"[{time.time()}] start_network() METHOD ENTRY\n")
+                f.write(f"[{time.time()}] type(self) = {type(self)}\n")
+                f.write(f"[{time.time()}] self.__class__ = {self.__class__}\n")
+                f.write(f"[{time.time()}] self.__class__.__name__ = {self.__class__.__name__}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass  # Ignore file errors
+
+        print("=" * 80, file=sys.stderr, flush=True)
+        print("[COFINEX] start_network() METHOD ENTRY - FIRST LINE", file=sys.stderr, flush=True)
+        print("=" * 80, file=sys.stderr, flush=True)
+
+        # CRITICAL: Write to file FIRST before anything else
+        debug_file = "/tmp/cofinex_start_network.txt"
+        try:
+            with open(debug_file, "a") as f:
+                f.write(f"\n{'=' * 60}\n")
+                f.write(f"[{time.time()}] ========== start_network() CALLED ==========\n")
+                f.write(f"[{time.time()}] self._trading_pairs = {getattr(self, '_trading_pairs', 'NOT SET')}\n")
+                f.write(f"[{time.time()}] self.trading_pairs = {self.trading_pairs}\n")
+                f.write(f"[{time.time()}] type(self) = {type(self)}\n")
+                f.write(f"[{time.time()}] isinstance(self, CofinexExchange) = {isinstance(self, CofinexExchange)}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            # Even if file write fails, try stderr
+            print(f"[COFINEX] ERROR writing to debug file: {e}", file=sys.stderr, flush=True)
+
+        # Also print to stderr immediately
+        print("[COFINEX] ========== start_network() CALLED ==========", file=sys.stderr, flush=True)
+        print(f"[COFINEX] self._trading_pairs = {getattr(self, '_trading_pairs', 'NOT SET')}", file=sys.stderr, flush=True)
+        print(f"[COFINEX] self.trading_pairs = {self.trading_pairs}", file=sys.stderr, flush=True)
+        print(f"[COFINEX] self._trading_required = {getattr(self, '_trading_required', 'NOT SET')}", file=sys.stderr, flush=True)
+
         self.logger().info("Starting Cofinex connector...")
+        self.logger().info(f"Trading pairs: {self._trading_pairs}")
+        self.logger().info(f"Trading required: {self._trading_required}")
 
         try:
-            # Initialize authentication
-            if self.trading_required:
+            self._start_event_loop_watchdog()
+            print("[COFINEX] Starting network initialization...", file=sys.stderr, flush=True)
+
+            # Initialize trading pair symbol map (needed for all operations)
+            print("[COFINEX] Step 1: Initializing trading pair symbol map...", file=sys.stderr, flush=True)
+            print(f"[COFINEX] Step 1: self._trading_pairs = {self._trading_pairs}", file=sys.stderr, flush=True)
+            self.logger().info("Initializing trading pair symbol map...")
+            self.logger().info(f"Trading pairs available: {self._trading_pairs}")
+
+            # Force re-initialization if we have trading pairs (in case it was called earlier with empty pairs)
+            if self._trading_pairs and len(self._trading_pairs) > 0:
+                # Reset the map to None so it will be re-initialized
+                self._trading_pair_symbol_map = None
+                await self._initialize_trading_pair_symbol_map()
+            else:
+                self.logger().warning("No trading pairs configured - skipping symbol map initialization")
+
+            symbol_map = await self.trading_pair_symbol_map()
+            print(f"[COFINEX] Step 1 complete: {len(symbol_map)} pairs", file=sys.stderr, flush=True)
+            self.logger().info(f"Trading pair symbol map initialized. Total pairs: {len(symbol_map)}")
+
+            # Update trading rules (needed for order validation)
+            print("[COFINEX] Step 2: Updating trading rules...", file=sys.stderr, flush=True)
+            self.logger().info("Updating trading rules...")
+            await self._update_trading_rules()
+            print(f"[COFINEX] Step 2 complete: {len(self._trading_rules)} rules", file=sys.stderr, flush=True)
+            self.logger().info(f"Trading rules updated. Total rules: {len(self._trading_rules)}")
+
+            # Initialize authentication (if trading required)
+            if self._trading_required:
+                print("[COFINEX] Step 3: Initializing authentication...", file=sys.stderr, flush=True)
+                self.logger().info("Initializing authentication...")
                 await self._initialize_auth()
+                print("[COFINEX] Step 3 complete: Authentication initialized", file=sys.stderr, flush=True)
+                self.logger().info("Authentication initialized")
+            else:
+                print("[COFINEX] Step 3: Paper trading mode - skipping authentication", file=sys.stderr, flush=True)
+                self.logger().info("Paper trading mode: Skipping authentication")
 
-            # Start order book tracking
-            await self._start_order_book_tracking()
+            # Ensure trading rules are initialized before starting network
+            # This is critical because orders might be placed before the network fully starts
+            if len(self._trading_rules) == 0:
+                self.logger().warning("Trading rules not initialized - initializing now...")
+                await self._update_trading_rules()
 
-            # Start user stream if trading is required
-            if self.trading_required and self._auth:
-                await self._start_user_stream_tracking()
+            # Call parent start_network() which will:
+            # - Start the order book tracker (already created in __init__)
+            # - Start trading rules polling
+            # - Start trading fees polling
+            # - Start status polling
+            # - Start user stream tracker and event listener
+            import time
+            step4_start = time.time()
+            print(f"[COFINEX] Step 4: Starting parent network components... (time: {time.strftime('%H:%M:%S')})", file=sys.stderr, flush=True)
+            self.logger().info("Starting parent network components (order book tracker, polling tasks)...")
+            print("[COFINEX] Step 4: About to call super().start_network()", file=sys.stderr, flush=True)
+            await super().start_network()
+            step4_elapsed = time.time() - step4_start
+            print(f"[COFINEX] Step 4 complete: Parent network started in {step4_elapsed:.2f}s", file=sys.stderr, flush=True)
+            self.logger().info(f"Parent network started in {step4_elapsed:.2f}s")
 
-            # Start status polling
-            self._status_polling_task = safe_ensure_future(self._status_polling_loop())
-
+            print("[COFINEX] All steps complete - connector started successfully", file=sys.stderr, flush=True)
             self.logger().info("Cofinex connector started successfully")
 
         except Exception as e:
-            self.logger().error(f"Failed to start Cofinex connector: {e}")
+            self.logger().error(f"Failed to start Cofinex connector: {e}", exc_info=True)
             raise
+
+    async def check_network(self) -> NetworkStatus:
+        """
+        Check network connectivity
+
+        Override to add logging and timeout
+        """
+        import asyncio
+        import sys
+        print("=" * 80, file=sys.stderr, flush=True)
+        print("[COFINEX] check_network() METHOD ENTRY - FIRST LINE", file=sys.stderr, flush=True)
+        print("=" * 80, file=sys.stderr, flush=True)
+        self.logger().info("Checking network connectivity...")
+        try:
+            # Add timeout to prevent hanging
+            result = await asyncio.wait_for(super().check_network(), timeout=10.0)
+            print(f"[COFINEX] check_network() returned: {result}", file=sys.stderr, flush=True)
+            self.logger().info(f"Network check result: {result}")
+            return result
+        except asyncio.TimeoutError:
+            print("[COFINEX] check_network() TIMEOUT after 10s", file=sys.stderr, flush=True)
+            self.logger().error("Network check timed out after 10 seconds")
+            return NetworkStatus.NOT_CONNECTED
+        except Exception as e:
+            print(f"[COFINEX] check_network() exception: {e}", file=sys.stderr, flush=True)
+            self.logger().error(f"Network check failed: {e}", exc_info=True)
+            return NetworkStatus.NOT_CONNECTED
 
     async def stop_network(self):
         """
         Stop the exchange connector
 
-        TODO: Implement proper shutdown sequence:
-        1. Cancel all active tasks
-        2. Close WebSocket connections
-        3. Cancel all open orders (optional)
-        4. Clean up resources
+        Calls parent stop_network() which handles:
+        - Stopping order book tracker
+        - Cancelling all polling tasks
+        - Stopping user stream tracker
         """
         self.logger().info("Stopping Cofinex connector...")
+        self._stop_event_loop_watchdog()
+        await super().stop_network()
+        self.logger().info("Cofinex connector stopped")
 
-        try:
-            # Cancel status polling
-            if self._status_polling_task:
-                self._status_polling_task.cancel()
-                try:
-                    await self._status_polling_task
-                except asyncio.CancelledError:
-                    pass
+    async def _watchdog_heartbeat(self):
+        """Update a heartbeat timestamp from the event loop."""
+        while not self._loop_watchdog_stop.is_set():
+            self._loop_heartbeat = time.monotonic()
+            await asyncio.sleep(1.0)
 
-            # Stop user stream
-            if self._user_stream_tracker:
-                await self._user_stream_tracker.stop()
+    def _start_event_loop_watchdog(self):
+        if self._loop_watchdog_thread is not None and self._loop_watchdog_thread.is_alive():
+            return
+        self._loop_watchdog_stop = threading.Event()
+        self._loop_heartbeat = time.monotonic()
+        self._loop_watchdog_dumped = False
+        self._loop_watchdog_task = safe_ensure_future(self._watchdog_heartbeat())
+        self._loop_watchdog_thread = threading.Thread(
+            target=self._watchdog_thread_fn,
+            name="cofinex_loop_watchdog",
+            daemon=True,
+        )
+        self._loop_watchdog_thread.start()
+        self.logger().info("Event loop watchdog started (threshold: 15s).")
 
-            # Stop order book tracker
-            if self._order_book_tracker:
-                await self._order_book_tracker.stop()
+    def _stop_event_loop_watchdog(self):
+        if self._loop_watchdog_stop is not None:
+            self._loop_watchdog_stop.set()
+        if self._loop_watchdog_task is not None:
+            self._loop_watchdog_task.cancel()
+        if self._loop_watchdog_thread is not None and self._loop_watchdog_thread.is_alive():
+            self._loop_watchdog_thread.join(timeout=1.0)
+        self._loop_watchdog_task = None
+        self._loop_watchdog_thread = None
+        self._loop_watchdog_stop = None
+        self._loop_watchdog_dumped = False
 
-            self.logger().info("Cofinex connector stopped")
-
-        except Exception as e:
-            self.logger().error(f"Error stopping Cofinex connector: {e}")
+    def _watchdog_thread_fn(self):
+        threshold_seconds = 15.0
+        check_interval = 2.0
+        while not self._loop_watchdog_stop.is_set():
+            time.sleep(check_interval)
+            gap = time.monotonic() - self._loop_heartbeat
+            if gap > threshold_seconds:
+                if not self._loop_watchdog_dumped:
+                    self._loop_watchdog_dumped = True
+                    self.logger().error(
+                        "Event loop heartbeat stalled for %.2fs (threshold %.2fs). Dumping stacks.",
+                        gap,
+                        threshold_seconds,
+                    )
+                    thread_names = {t.ident: t.name for t in threading.enumerate()}
+                    for thread_id, frame in sys._current_frames().items():
+                        thread_name = thread_names.get(thread_id, "unknown")
+                        stack = "".join(traceback.format_stack(frame))
+                        self.logger().error(
+                            "Thread %s (id=%s) stack:\n%s",
+                            thread_name,
+                            thread_id,
+                            stack,
+                        )
+            else:
+                if self._loop_watchdog_dumped:
+                    self.logger().info(
+                        "Event loop heartbeat recovered after stall (gap %.2fs).",
+                        gap,
+                    )
+                self._loop_watchdog_dumped = False
 
     # =============================================================================
     # AUTHENTICATION
@@ -191,24 +828,48 @@ class CofinexExchange(ExchangeBase):
         """
         Initialize OAuth 2.0 authentication
 
-        Gets username and password from config and creates CofinexAuth instance.
+        Gets username and password from instance variables or config and creates CofinexAuth instance.
         The auth object will handle token requests automatically.
         """
-        # Get credentials from client_config_map
+        # Get credentials from instance variables or config
         # Note: Cofinex uses OAuth 2.0, so we need username/password, not API key/secret
-        try:
-            username = self.client_config_map.cofinex_username.get_secret_value()
-            password = self.client_config_map.cofinex_password.get_secret_value()
-        except AttributeError:
-            # Fallback if config map structure is different
-            # This will be set properly when connector is registered
+        username = self._cofinex_username
+        password = self._cofinex_password
+
+        # Convert SecretStr to string if needed
+        if username and hasattr(username, 'get_secret_value'):
+            username = username.get_secret_value()
+        if password and hasattr(password, 'get_secret_value'):
+            password = password.get_secret_value()
+
+        # Try to get from client_config_map if not set in instance
+        if not username or not password:
+            try:
+                from hummingbot.client.config.config_helpers import get_client_config
+                client_config = get_client_config()
+                if hasattr(client_config, 'cofinex_username') and hasattr(client_config, 'cofinex_password'):
+                    username_val = client_config.cofinex_username
+                    password_val = client_config.cofinex_password
+                    if username_val:
+                        username = username_val.get_secret_value() if hasattr(username_val, 'get_secret_value') else username_val
+                    if password_val:
+                        password = password_val.get_secret_value() if hasattr(password_val, 'get_secret_value') else password_val
+            except (AttributeError, ImportError):
+                pass
+
+        # For paper trading, credentials are not required
+        # Check if this is paper trade mode by checking if trading_required is False
+        # or if credentials are empty (paper trade allows empty credentials)
+        if not self.trading_required:
+            # Paper trading mode - skip authentication
+            self.logger().info("Paper trading mode: Skipping OAuth authentication")
+            return
+
+        if not username or not password:
             raise Exception(
                 "Cofinex credentials not configured. "
                 "Please run 'connect cofinex' to configure username and password."
             )
-
-        if not username or not password:
-            raise Exception("Cofinex username and password not configured")
 
         # Create auth instance
         # Note: api_factory will be set after web_assistants_factory is created
@@ -228,31 +889,9 @@ class CofinexExchange(ExchangeBase):
     # ORDER BOOK MANAGEMENT
     # =============================================================================
 
-    async def _start_order_book_tracking(self):
-        """
-        Start tracking order books for all trading pairs
-
-        TODO: Implement order book tracking:
-        1. Initialize order books for each trading pair
-        2. Start WebSocket connections for real-time updates
-        3. Start REST polling as fallback
-        4. Handle order book updates
-        """
-        for trading_pair in self.trading_pairs:
-            try:
-                # Initialize order book
-                self._order_books[trading_pair] = OrderBook()
-
-                # TODO: Start WebSocket subscription for order book updates
-                # await self._subscribe_to_order_book(trading_pair)
-
-                # TODO: Start REST polling as fallback
-                # safe_ensure_future(self._poll_order_book(trading_pair))
-
-                self.logger().info(f"Started order book tracking for {trading_pair}")
-
-            except Exception as e:
-                self.logger().error(f"Failed to start order book tracking for {trading_pair}: {e}")
+    # Note: _start_order_book_tracking() is no longer needed
+    # The order book tracker is created in ExchangePyBase.__init__() and started in super().start_network()
+    # This method is kept for reference but not used
 
     async def get_order_book(self, trading_pair: str) -> Optional[OrderBook]:
         """
@@ -326,7 +965,7 @@ class CofinexExchange(ExchangeBase):
         # For now, return cached balance or default
         return self._account_balances.get(currency, Decimal("0"))
 
-    async def get_all_balances(self) -> Dict[str, Decimal]:
+    def get_all_balances(self) -> Dict[str, Decimal]:
         """
         Get all account balances
 
@@ -340,83 +979,253 @@ class CofinexExchange(ExchangeBase):
     # ORDER MANAGEMENT
     # =============================================================================
 
-    async def place_order(self,
-                          trading_pair: str,
-                          is_buy: bool,
-                          amount: Decimal,
-                          order_type: OrderType,
-                          price: Decimal = None) -> str:
+    async def _create_order(self,
+                            trade_type: TradeType,
+                            order_id: str,
+                            trading_pair: str,
+                            amount: Decimal,
+                            order_type: OrderType,
+                            price: Optional[Decimal] = None,
+                            **kwargs):
         """
-        Place an order on Cofinex
+        Override _create_order to handle missing trading rules for paper trading.
+        """
+        debug_file = "/tmp/cofinex_place_order.txt"
 
-        TODO: Implement order placement:
-        1. Validate order parameters
-        2. Check trading rules (min/max size, price precision)
-        3. Generate order ID
-        4. Make API call to place order
-        5. Handle response and errors
-        6. Store order in tracking system
+        # CRITICAL: Write to debug file immediately with flush AND stderr
+        fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] COFINEX _create_order OVERRIDE CALLED: order_id={order_id}, trading_pair={trading_pair}\n".encode())
+        os.fsync(fd)
+        os.close(fd)
+        print(f"[COFINEX] _create_order OVERRIDE called: order_id={order_id}, trading_pair={trading_pair}", file=sys.stderr, flush=True)
+
+        try:
+            self.logger().info(f"[COFINEX OVERRIDE] _create_order called for {trading_pair}, order_id={order_id}")
+
+            # Ensure trading rules exist - try to update them if missing
+            if trading_pair not in self._trading_rules:
+                self.logger().warning(f"Trading rules not found for {trading_pair} - attempting to update...")
+                try:
+                    await self._update_trading_rules()
+                except Exception as e:
+                    self.logger().warning(f"Failed to update trading rules: {e} - creating default rule")
+
+                # If still not found, create default rule for paper trading
+                if trading_pair not in self._trading_rules:
+                    self.logger().warning(f"Trading rules still not found for {trading_pair} - creating default rule")
+                    from hummingbot.connector.trading_rule import TradingRule
+                    default_rule = TradingRule(
+                        trading_pair=trading_pair,
+                        min_order_size=Decimal("0.001"),
+                        max_order_size=Decimal("900000000000000000000"),
+                        min_price_increment=Decimal("0.01"),
+                        min_base_amount_increment=Decimal("0.001"),
+                        min_notional_size=Decimal("1"),
+                    )
+                    self._trading_rules[trading_pair] = default_rule
+                    self.logger().info(f"Created default trading rule for {trading_pair}")
+                    print(f"[COFINEX] Created default trading rule for {trading_pair}", file=sys.stderr, flush=True)
+
+            fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] About to call super()._create_order(), trading_rules={list(self._trading_rules.keys())}\n".encode())
+            os.fsync(fd)
+            os.close(fd)
+
+            # Call parent _create_order which will validate and place the order
+            await super()._create_order(
+                trade_type=trade_type,
+                order_id=order_id,
+                trading_pair=trading_pair,
+                amount=amount,
+                order_type=order_type,
+                price=price,
+                **kwargs
+            )
+
+            fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _create_order completed successfully\n".encode())
+            os.fsync(fd)
+            os.close(fd)
+            print("[COFINEX] _create_order completed successfully", file=sys.stderr, flush=True)
+
+        except Exception as e:
+            fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            import traceback
+            os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _create_order EXCEPTION: {e}\n".encode())
+            os.write(fd, traceback.format_exc().encode())
+            os.fsync(fd)
+            os.close(fd)
+            print(f"[COFINEX] _create_order EXCEPTION: {e}", file=sys.stderr, flush=True)
+            self.logger().error(f"Exception in _create_order: {e}", exc_info=True)
+            raise
+
+    async def _place_order(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Optional[Decimal] = None,
+        **kwargs,
+    ) -> Tuple[str, float]:
+        """
+        Place an order on Cofinex.
+
+        This is the abstract method required by ExchangePyBase.
+        It is called by _place_order_and_process_update after order validation.
+
+        For paper trading, this returns a generated exchange order ID and timestamp.
+        For live trading, this should make an actual API call to place the order.
 
         Args:
-            trading_pair: Trading pair symbol
-            is_buy: True for buy order, False for sell
+            order_id: Client order ID (assigned by Hummingbot)
+            trading_pair: Trading pair symbol (e.g., "BTC-USDT")
             amount: Order quantity
-            order_type: Order type (LIMIT, MARKET, etc.)
+            trade_type: BUY or SELL
+            order_type: LIMIT, MARKET, etc.
             price: Order price (required for LIMIT orders)
+            **kwargs: Additional parameters
 
         Returns:
-            Order ID if successful
-
-        Raises:
-            Exception: If order placement fails
+            Tuple of (exchange_order_id, timestamp)
         """
-        if not self._auth:
-            raise Exception("Not authenticated")
+        debug_file = "/tmp/cofinex_place_order.txt"
+        try:
+            with open(debug_file, "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order called: order_id={order_id}, trading_pair={trading_pair}, amount={amount}, trade_type={trade_type}, order_type={order_type}, price={price}\n")
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order: is_trading_required={self.is_trading_required}, _trading_required={getattr(self, '_trading_required', 'NOT SET')}\n")
+                f.flush()
+            print(f"[COFINEX] _place_order called: order_id={order_id}", file=sys.stderr, flush=True)
+            self.logger().info(f"Placing {trade_type.name} {order_type.name} order: {order_id} for {amount} {trading_pair} at {price}")
 
-        # TODO: Validate order parameters
-        # - Check if trading pair is supported
-        # - Validate order size against trading rules
-        # - Validate price precision
-        # - Check account balance
+            # For paper trading, we don't need authentication
+            # For live trading, check authentication here
+            if self.is_trading_required and not self._auth:
+                raise Exception("Not authenticated for live trading")
 
-        # Generate order ID
-        order_id = f"cofinex_{int(time.time() * 1000)}_{trading_pair}"
+            # Generate exchange order ID
+            # For paper trading, use the client order ID as exchange order ID
+            # For live trading, this should come from the API response
+            if not self.is_trading_required:
+                # Paper trading mode - return immediately with generated ID
+                exchange_order_id = f"PAPER_{order_id}"
+                # Use time.time() instead of current_timestamp in case it's not initialized yet
+                timestamp = float(time.time())
+                with open(debug_file, "a") as f:
+                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order (paper): returning exchange_order_id={exchange_order_id}, timestamp={timestamp}\n")
+                    f.flush()
+                print(f"[COFINEX] _place_order (paper): returning exchange_order_id={exchange_order_id}, timestamp={timestamp}", file=sys.stderr, flush=True)
+                self.logger().info(f"Paper trading order {order_id} placed with exchange_order_id {exchange_order_id}")
+                return exchange_order_id, timestamp
+        except Exception as e:
+            with open(debug_file, "a") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order EXCEPTION: {e}\n")
+                import traceback
+                f.write(traceback.format_exc())
+                f.flush()
+            print(f"[COFINEX] _place_order EXCEPTION: {e}", file=sys.stderr, flush=True)
+            self.logger().error(f"Exception in _place_order: {e}", exc_info=True)
+            raise
 
-        # TODO: Make actual API call to place order
-        # Example implementation:
+        # TODO: Implement actual API call for live trading
+        # This is the live trading implementation:
+        #
+        # # Convert trading pair to exchange symbol format
+        # exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        #
+        # # Build order data
         # order_data = {
-        #     "symbol": trading_pair,
-        #     "side": "BUY" if is_buy else "SELL",
-        #     "type": ORDER_TYPES[order_type.name],
+        #     "symbol": exchange_symbol,
+        #     "side": "BUY" if trade_type == TradeType.BUY else "SELL",
+        #     "type": "LIMIT" if order_type == OrderType.LIMIT else "MARKET",
         #     "quantity": str(amount),
         #     "price": str(price) if price else None,
         #     "timeInForce": "GTC"
         # }
         #
-        # response = await self._api_request("POST", "/order", data=order_data)
-        # order_id = response["orderId"]
+        # # Make API request
+        # response = await self._api_post(
+        #     path_url=CONSTANTS.ORDER_PATH_URL,
+        #     data=order_data,
+        #     is_auth_required=True,
+        #     limit_id=CONSTANTS.ORDER_PATH_URL,
+        # )
+        #
+        # exchange_order_id = str(response["orderId"])
+        # timestamp = self.current_timestamp
+        # return exchange_order_id, timestamp
 
-        # Create limit order object
-        limit_order = LimitOrder(
-            client_order_id=order_id,
-            trading_pair=trading_pair,
-            is_buy=is_buy,
-            base_currency=trading_pair.split("USDT")[0],
-            quote_currency="USDT",
-            price=price,
-            quantity=amount,
-            filled_quantity=Decimal("0"),
-            status="NEW",
-            order_type=order_type,
-            time_in_force="GTC"
-        )
+        # For now, if live trading is required but not implemented, raise an error
+        raise NotImplementedError("Live trading order placement not yet implemented")
 
-        # Store order
-        self._in_flight_orders[order_id] = limit_order
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
+        """
+        Cancel an order on Cofinex.
 
-        self.logger().info(f"Placed {order_type.name} order: {order_id}")
+        This is the abstract method required by ExchangePyBase.
+        It is called by the order cancellation flow.
 
-        return order_id
+        For paper trading, this returns True immediately.
+        For live trading, this should make an actual API call to cancel the order.
+
+        Args:
+            order_id: Client order ID
+            tracked_order: InFlightOrder object tracking the order
+
+        Returns:
+            True if cancellation was successful, False otherwise
+        """
+        import sys
+        print(f"[COFINEX] _place_cancel called: order_id={order_id}, exchange_order_id={tracked_order.exchange_order_id}", file=sys.stderr, flush=True)
+        self.logger().info(f"Canceling order: {order_id} (exchange_order_id: {tracked_order.exchange_order_id})")
+
+        # For paper trading, we don't need authentication
+        if not self.is_trading_required:
+            # Paper trading mode - return immediately
+            print("[COFINEX] _place_cancel (paper): returning True", file=sys.stderr, flush=True)
+            self.logger().info(f"Paper trading order {order_id} canceled successfully")
+            return True
+
+        # For live trading, check authentication
+        if not self._auth:
+            raise Exception("Not authenticated for live trading")
+
+        # TODO: Implement actual API call for live trading
+        # This is the live trading implementation:
+        #
+        # exchange_order_id = tracked_order.exchange_order_id
+        # if not exchange_order_id or exchange_order_id == "UNKNOWN":
+        #     self.logger().warning(f"Cannot cancel order {order_id} without exchange_order_id")
+        #     return False
+        #
+        # # Convert trading pair to exchange symbol format
+        # exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
+        #
+        # # Make API request to cancel order
+        # try:
+        #     response = await self._api_delete(
+        #         path_url=f"{CONSTANTS.ORDER_PATH_URL}/{exchange_order_id}",
+        #         params={"symbol": exchange_symbol},
+        #         is_auth_required=True,
+        #         limit_id=CONSTANTS.ORDER_PATH_URL,
+        #     )
+        #
+        #     if response.get("status") == "CANCELED":
+        #         return True
+        #     else:
+        #         self.logger().warning(f"Order cancellation returned unexpected status: {response.get('status')}")
+        #         return False
+        # except IOError as e:
+        #     # Check if order not found
+        #     if self._is_order_not_found_during_cancelation_error(e):
+        #         self.logger().info(f"Order {order_id} not found during cancellation (may already be canceled)")
+        #         await self._order_tracker.process_order_not_found(order_id)
+        #         return True
+        #     raise
+
+        # For now, if live trading is required but not implemented, raise an error
+        raise NotImplementedError("Live trading order cancellation not yet implemented")
 
     async def cancel_order(self, trading_pair: str, order_id: str) -> bool:
         """
@@ -496,33 +1305,24 @@ class CofinexExchange(ExchangeBase):
     # =============================================================================
     # TRADING RULES
     # =============================================================================
+    # Note: _update_trading_rules() is inherited from ExchangePyBase
+    # It calls _make_trading_rules_request() -> _format_trading_rules() -> _initialize_trading_pair_symbols_from_exchange_info()
 
-    async def get_trading_rules(self, trading_pair: str) -> Dict[str, Any]:
+    async def get_trading_rules(self, trading_pair: str) -> Optional[TradingRule]:
         """
         Get trading rules for a trading pair
 
-        TODO: Implement trading rules retrieval:
-        1. Make API call to get trading rules
-        2. Parse response and extract rules
-        3. Cache rules for performance
-        4. Return formatted rules
-
         Args:
-            trading_pair: Trading pair symbol
+            trading_pair: Trading pair symbol in Hummingbot format (e.g., "BTC-USDT")
 
         Returns:
-            Dictionary of trading rules
+            TradingRule object or None if not found
         """
-        # TODO: Implement actual trading rules retrieval
-        # This typically includes:
-        # - Minimum order size
-        # - Maximum order size
-        # - Price precision
-        # - Quantity precision
-        # - Trading fees
-        # - Market status
+        # Ensure trading rules are loaded
+        if not self._trading_rules:
+            await self._update_trading_rules()
 
-        return self._trading_rules.get(trading_pair, DEFAULT_TRADING_RULES.copy())
+        return self._trading_rules.get(trading_pair)
 
     # =============================================================================
     # FEE CALCULATION
@@ -565,7 +1365,6 @@ class CofinexExchange(ExchangeBase):
 
         # For now, use default fees
         fee_rate = Decimal("0.001")  # 0.1%
-        fee = amount * price * fee_rate if price else amount * fee_rate
 
         return TradeFeeBase.new_spot_fee(
             fee_schema=TradeFeeBase.new_spot_fee_schema(),
@@ -639,12 +1438,326 @@ class CofinexExchange(ExchangeBase):
         return {}
 
     # =============================================================================
+    # TRADING PAIR SYMBOL MAPPING
+    # =============================================================================
+
+    async def _initialize_trading_pair_symbol_map(self):
+        """
+        Initialize the mapping between exchange symbols and Hummingbot trading pairs.
+
+        Fetches trading pairs from Cofinex API and builds a bidirectional mapping:
+        - Exchange symbol (e.g., "MASUSDT") -> Hummingbot trading pair (e.g., "MAS-USDT")
+
+        Optimized to only fetch the pairs we actually need instead of all 725 pairs.
+        """
+        try:
+            import sys
+            print(f"[COFINEX] _initialize_trading_pair_symbol_map called. self._trading_pairs = {getattr(self, '_trading_pairs', 'NOT SET')}", file=sys.stderr, flush=True)
+            self.logger().info(f"_initialize_trading_pair_symbol_map called. Trading pairs: {getattr(self, '_trading_pairs', 'NOT SET')}")
+
+            # Check if we have configured trading pairs
+            # If we do, use the per-pair endpoint (faster, only fetches what we need)
+            # If we don't (e.g., during autocompletion), skip initialization - don't use bulk endpoint
+            if not self._trading_pairs or len(self._trading_pairs) == 0:
+                # No configured pairs - this is likely autocompletion or early initialization
+                # Don't fetch anything - the symbol map will be built when pairs are configured
+                # Don't set an empty map - leave it as None so it will be retried when pairs are available
+                print("[COFINEX] No trading pairs configured - skipping initialization (will retry when pairs are set)", file=sys.stderr, flush=True)
+                self.logger().debug("No configured trading pairs yet - skipping initialization (will retry when pairs are set)")
+                # Don't set the map - leave it as None so trading_pair_symbol_map_ready() returns False
+                # This allows it to be called again later when trading pairs are available
+                return
+
+            # IMPORTANT: We have trading pairs now - use per-pair endpoint
+            print(f"[COFINEX] _initialize_trading_pair_symbol_map: Using per-pair endpoint for {len(self._trading_pairs)} pairs: {self._trading_pairs}", file=sys.stderr, flush=True)
+            self.logger().info(f"Using per-pair endpoint for {len(self._trading_pairs)} configured pairs: {self._trading_pairs}")
+
+            # We have configured pairs - use the optimized per-pair endpoint
+            trading_pairs_data = await self._fetch_trading_pairs_for_configured_pairs()
+
+            if not trading_pairs_data:
+                print("[COFINEX] No trading pairs data fetched - setting empty symbol map", file=sys.stderr, flush=True)
+                self.logger().warning("No trading pairs data fetched - setting empty symbol map")
+                self._set_trading_pair_symbol_map(bidict())
+                return
+
+            # Build the mapping
+            mapping = bidict()
+            for pair_data in trading_pairs_data:
+                symbol = pair_data.get("symbol", "").upper()
+                data = pair_data.get("data", {})
+                base_coin = data.get("baseCoin", "").upper()
+                quote_coin = data.get("quoteCoin", "").upper()
+
+                if not symbol or not base_coin or not quote_coin:
+                    continue
+
+                # Build Hummingbot trading pair format: BASE-QUOTE
+                hb_trading_pair = combine_to_hb_trading_pair(base=base_coin, quote=quote_coin)
+
+                # Check for duplicates
+                if symbol in mapping:
+                    self.logger().warning(
+                        f"Duplicate symbol {symbol} found. "
+                        f"Existing: {mapping[symbol]}, New: {hb_trading_pair}. Skipping."
+                    )
+                    continue
+                elif hb_trading_pair in mapping.inverse:
+                    self.logger().warning(
+                        f"Duplicate trading pair {hb_trading_pair} found. "
+                        f"Existing symbol: {mapping.inverse[hb_trading_pair]}, New symbol: {symbol}. Skipping."
+                    )
+                    continue
+
+                mapping[symbol] = hb_trading_pair
+
+            # Set the mapping
+            self._set_trading_pair_symbol_map(mapping)
+            self.logger().info(f"Initialized trading pair symbol map with {len(mapping)} pairs")
+
+        except Exception as e:
+            self.logger().error(f"Error initializing trading pair symbol map: {e}", exc_info=True)
+            raise
+
+    async def _fetch_trading_pairs_for_configured_pairs(self) -> List[Dict[str, Any]]:
+        """
+        Fetch trading pair info only for the configured trading pairs.
+        Uses the per-pair endpoint /spot/v1/tradepair/{SYMBOL} instead of fetching all 725 pairs.
+
+        Returns:
+            List of trading pair dictionaries from the API response
+        """
+        try:
+            # Create a simple API factory for public endpoints (no auth needed)
+            from hummingbot.connector.exchange.cofinex.cofinex_web_utils import (
+                build_api_factory_without_time_synchronizer_pre_processor,
+                create_throttler,
+            )
+
+            throttler = create_throttler()
+            api_factory = build_api_factory_without_time_synchronizer_pre_processor(throttler)
+            rest_assistant = await api_factory.get_rest_assistant()
+
+            # Use domain from connector if available, otherwise default to "main"
+            domain = getattr(self, '_domain', CONSTANTS.DEFAULT_DOMAIN)
+            base_url = CONSTANTS.MARKET_DATA_BASE_URL.get(domain, CONSTANTS.MARKET_DATA_BASE_URL["main"])
+
+            # Fetch only the pairs we actually need
+            pairs = []
+            import asyncio
+
+            # Use trading_pairs property - it returns self._trading_pairs
+            trading_pairs_to_fetch = self.trading_pairs
+
+            if not trading_pairs_to_fetch:
+                # This should not happen since we check before calling this method
+                # But if it does, return empty list
+                self.logger().warning("No trading pairs to fetch - this method should only be called when pairs are configured")
+                return []
+
+            self.logger().info(f"Fetching pair info for {len(trading_pairs_to_fetch)} configured pairs: {trading_pairs_to_fetch}")
+
+            for trading_pair in trading_pairs_to_fetch:
+                # Convert Hummingbot format (BTC-USDT) to API format (BTC_USDT)
+                api_symbol = trading_pair.replace("-", "_").upper()
+                url = f"{base_url}/spot/v1/tradepair/{api_symbol}"
+
+                self.logger().info(f"Fetching pair info for {trading_pair} from {url}")
+                try:
+                    response = await asyncio.wait_for(
+                        rest_assistant.execute_request(
+                            url=url,
+                            method=RESTMethod.GET,
+                            throttler_limit_id=CONSTANTS.TRADING_PAIRS_PATH_URL,
+                        ),
+                        timeout=5.0  # 5 seconds per pair should be enough
+                    )
+
+                    # Log the raw response for debugging
+                    self.logger().debug(f"Raw response for {trading_pair}: {response}")
+
+                    # Parse response
+                    # Expected format: {
+                    #   "code": "200",
+                    #   "msg": "success",
+                    #   "data": {
+                    #       "symbol": "BTC_USDT",
+                    #       "exchange": "bitget",
+                    #       "data": {
+                    #           "symbol": "BTCUSDT",
+                    #           "baseCoin": "BTC",
+                    #           "quoteCoin": "USDT",
+                    #           ...
+                    #       }
+                    #   }
+                    # }
+                    if not isinstance(response, dict):
+                        self.logger().warning(f"Invalid response type for {trading_pair}: {type(response)}")
+                        continue
+
+                    response_code = response.get("code")
+                    if response_code != "200":
+                        error_msg = response.get("msg", "Unknown error")
+                        self.logger().warning(f"API error for {trading_pair}: code={response_code}, msg={error_msg}")
+                        continue
+
+                    # Get outer data object
+                    outer_data = response.get("data", {})
+                    if not outer_data:
+                        self.logger().warning(f"No outer data in response for {trading_pair}, response: {response}")
+                        continue
+
+                    # Get inner data object which contains the actual pair information
+                    pair_data = outer_data.get("data", {})
+                    if not pair_data:
+                        self.logger().warning(f"No inner data in response for {trading_pair}, outer_data: {outer_data}")
+                        continue
+
+                    # Extract symbol from the inner data object
+                    # The inner data has "symbol": "BTCUSDT" (no underscore)
+                    symbol = pair_data.get("symbol", "")
+                    if not symbol:
+                        # Fallback: convert BTC_USDT to BTCUSDT
+                        symbol = api_symbol.replace("_", "").upper()
+                    else:
+                        symbol = symbol.upper()
+
+                    # Wrap in the same format as the bulk endpoint
+                    # The bulk endpoint format is: {"symbol": "BTCUSDT", "data": {...}}
+                    pairs.append({
+                        "symbol": symbol,  # Should be "BTCUSDT" format to match bulk endpoint
+                        "data": pair_data  # The inner data object with baseCoin, quoteCoin, etc.
+                    })
+                    self.logger().info(f"Successfully fetched pair info for {trading_pair} (URL: {api_symbol}) -> symbol: {symbol}")
+
+                except asyncio.TimeoutError:
+                    self.logger().warning(f"Timeout (5s) fetching pair info for {trading_pair}, skipping")
+                except Exception as e:
+                    self.logger().error(f"Error fetching pair info for {trading_pair}: {e}", exc_info=True)
+
+            if not pairs:
+                self.logger().warning("No trading pairs fetched from API")
+                return []
+
+            self.logger().info(f"Fetched {len(pairs)} trading pairs from Cofinex API (only configured pairs)")
+            return pairs
+
+        except Exception as e:
+            self.logger().error(f"Error fetching trading pairs: {e}", exc_info=True)
+            # Re-raise to let caller handle it
+            raise
+
+    async def _fetch_trading_pairs(self) -> List[Dict[str, Any]]:
+        """
+        Fetch ALL trading pairs from Cofinex Market Data API.
+        This is the original method that fetches all 725 pairs - kept for backward compatibility.
+
+        Returns:
+            List of trading pair dictionaries from the API response
+        """
+        try:
+            # Create a simple API factory for public endpoints (no auth needed)
+            from hummingbot.connector.exchange.cofinex.cofinex_web_utils import (
+                build_api_factory_without_time_synchronizer_pre_processor,
+                create_throttler,
+            )
+
+            throttler = create_throttler()
+            api_factory = build_api_factory_without_time_synchronizer_pre_processor(throttler)
+            rest_assistant = await api_factory.get_rest_assistant()
+
+            # Build URL for market data API
+            # Use domain from connector if available, otherwise default to "main"
+            domain = getattr(self, '_domain', CONSTANTS.DEFAULT_DOMAIN)
+            url = CONSTANTS.MARKET_DATA_BASE_URL.get(domain, CONSTANTS.MARKET_DATA_BASE_URL["main"]) + CONSTANTS.TRADING_PAIRS_PATH_URL
+
+            # Make the API request with timeout
+            # Note: API can sometimes take 5+ seconds, so we use a generous timeout
+            import asyncio
+            self.logger().info(f"Fetching trading pairs from {url} (this may take 5+ seconds)...")
+            try:
+                response = await asyncio.wait_for(
+                    rest_assistant.execute_request(
+                        url=url,
+                        method=RESTMethod.GET,
+                        throttler_limit_id=CONSTANTS.TRADING_PAIRS_PATH_URL,
+                    ),
+                    timeout=20.0  # Increased to 20 seconds to handle slow API responses
+                )
+                self.logger().info("Successfully fetched trading pairs from Cofinex API")
+            except asyncio.TimeoutError:
+                self.logger().error("Timeout (20s) fetching trading pairs from Cofinex API")
+                raise Exception("Timeout fetching trading pairs from Cofinex API")
+
+            # Parse response
+            # Expected format: {"code": "200", "msg": "success", "data": {"pairs": [...]}}
+            if not isinstance(response, dict):
+                raise Exception(f"Unexpected response type: {type(response)}")
+
+            if response.get("code") != "200":
+                error_msg = response.get("msg", "Unknown error")
+                raise Exception(f"API returned error: {error_msg}")
+
+            data = response.get("data", {})
+            if not isinstance(data, dict):
+                raise Exception(f"Unexpected data type: {type(data)}")
+
+            pairs = data.get("pairs", [])
+
+            if not pairs:
+                self.logger().warning("No trading pairs returned from API")
+                return []
+
+            self.logger().info(f"Fetched {len(pairs)} trading pairs from Cofinex API")
+            # Log first few pairs as examples
+            if pairs:
+                sample_pairs = pairs[:5]
+                for pair in sample_pairs:
+                    symbol = pair.get("symbol", "unknown")
+                    data = pair.get("data", {})
+                    base = data.get("baseCoin", "?")
+                    quote = data.get("quoteCoin", "?")
+                    self.logger().debug(f"Sample pair: {symbol} -> {base}-{quote}")
+            return pairs
+
+        except Exception as e:
+            self.logger().error(f"Error fetching trading pairs: {e}", exc_info=True)
+            # Re-raise to let caller handle it
+            raise
+
+    # =============================================================================
     # UTILITY METHODS
     # =============================================================================
 
-    def logger(self) -> HummingbotLogger:
-        """Get logger instance"""
-        return HummingbotLogger(self.__class__.__name__)
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        """Get logger instance - use parent class logger"""
+        return ExchangePyBase.logger()
+
+    async def _make_network_check_request(self):
+        """
+        Override to add timeout and logging to prevent hangs
+        """
+        import asyncio
+        import sys
+        print("[COFINEX] _make_network_check_request() called", file=sys.stderr, flush=True)
+        self.logger().info("Making network check request...")
+        try:
+            # Add timeout to prevent hanging
+            result = await asyncio.wait_for(
+                super()._make_network_check_request(),
+                timeout=5.0
+            )
+            print("[COFINEX] _make_network_check_request() completed", file=sys.stderr, flush=True)
+            return result
+        except asyncio.TimeoutError:
+            print("[COFINEX] _make_network_check_request() TIMEOUT after 5s", file=sys.stderr, flush=True)
+            self.logger().error("Network check request timed out after 5 seconds")
+            raise
+        except Exception as e:
+            print(f"[COFINEX] _make_network_check_request() exception: {e}", file=sys.stderr, flush=True)
+            self.logger().error(f"Network check request failed: {e}", exc_info=True)
+            raise
 
     def _parse_order_data(self, order_data: Dict[str, Any]) -> LimitOrder:
         """

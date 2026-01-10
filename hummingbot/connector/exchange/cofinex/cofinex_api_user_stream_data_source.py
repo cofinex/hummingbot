@@ -134,10 +134,12 @@ class CofinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
             rest_assistant = await self._api_factory.get_rest_assistant()
 
             # TODO: Adjust endpoint based on actual Cofinex API
+            rest_api_base_url = getattr(self._connector, "_rest_api_base_url", None) if self._connector else None
             response = await rest_assistant.execute_request(
                 url=web_utils.private_rest_url(
                     path_url=CONSTANTS.ACCOUNTS_PATH_URL,
-                    domain=self._domain
+                    domain=self._domain,
+                    rest_api_base_url=rest_api_base_url,
                 ),
                 method=RESTMethod.GET,
                 is_auth_required=True,
@@ -186,10 +188,12 @@ class CofinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
             # Poll open orders
             # TODO: Adjust endpoint based on actual Cofinex API
+            rest_api_base_url = getattr(self._connector, "_rest_api_base_url", None) if self._connector else None
             response = await rest_assistant.execute_request(
                 url=web_utils.private_rest_url(
                     path_url=CONSTANTS.OPEN_ORDERS_PATH_URL,
-                    domain=self._domain
+                    domain=self._domain,
+                    rest_api_base_url=rest_api_base_url,
                 ),
                 method=RESTMethod.GET,
                 is_auth_required=True,

@@ -1306,6 +1306,11 @@ cdef class PureMarketMakingStrategy(StrategyBase):
             self._create_timestamp = next_cycle
         if self._cancel_timestamp <= self._current_timestamp:
             self._cancel_timestamp = min(self._create_timestamp, next_cycle)
+        if self._logging_options & self.OPTION_LOG_STATUS_REPORT:
+            self.logger().info(
+                f"({self.trading_pair}) Refresh timers set. Next refresh in "
+                f"{(next_cycle - self._current_timestamp):.2f}s (at {next_cycle:.2f})."
+            )
 
     def notify_hb_app(self, msg: str):
         if self._hb_app_notification:

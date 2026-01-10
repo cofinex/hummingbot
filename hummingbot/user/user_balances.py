@@ -1,10 +1,10 @@
 import logging
 from decimal import Decimal
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from hummingbot.client.config.client_config_map import ClientConfigMap
-from hummingbot.client.config.config_helpers import get_connector_class
+from hummingbot.client.config.config_helpers import ClientConfigAdapter, get_connector_class
 from hummingbot.client.config.security import Security
 from hummingbot.client.settings import AllConnectorSettings, gateway_connector_trading_pairs
 from hummingbot.core.utils.async_utils import safe_gather
@@ -15,14 +15,43 @@ class UserBalances:
     __instance = None
 
     @staticmethod
-    def connect_market(exchange, client_config_map: ClientConfigMap, **api_details):
+    def connect_market(exchange, client_config_map: Union[ClientConfigAdapter, ClientConfigMap, None], **api_details):
         connector = None
         conn_setting = AllConnectorSettings.get_connector_settings()[exchange]
         if api_details or conn_setting.uses_gateway_generic_connector():
             connector_class = get_connector_class(exchange)
+            # Get balance_asset_limit and rate_limits_share_pct from client_config_map
+            # Follow the same pattern as connector_manager.py
+            balance_asset_limit = {}
+            rate_limits_share_pct = Decimal("100")
+            gateway_config = None
+
+            if client_config_map is not None:
+                try:
+                    # Try to access via hb_config (ClientConfigAdapter pattern)
+                    if hasattr(client_config_map, 'hb_config') and client_config_map.hb_config is not None:
+                        balance_asset_limit = getattr(client_config_map.hb_config, 'balance_asset_limit', {})
+                        rate_limits_share_pct = getattr(client_config_map.hb_config, 'rate_limits_share_pct', Decimal("100"))
+                        gateway_config = getattr(client_config_map.hb_config, 'gateway', None)
+                    # Fallback: try direct access (for ClientConfigMap)
+                    elif hasattr(client_config_map, 'balance_asset_limit'):
+                        balance_asset_limit = getattr(client_config_map, 'balance_asset_limit', {})
+                    if hasattr(client_config_map, 'rate_limits_share_pct'):
+                        rate_limits_share_pct = getattr(client_config_map, 'rate_limits_share_pct', Decimal("100"))
+                except (AttributeError, TypeError):
+                    # If any attribute access fails, use defaults
+                    pass
+
+            # Ensure balance_asset_limit is a dict (not None)
+            if balance_asset_limit is None:
+                balance_asset_limit = {}
+
             init_params = conn_setting.conn_init_parameters(
                 trading_pairs=gateway_connector_trading_pairs(conn_setting.name),
                 api_keys=api_details,
+                balance_asset_limit=balance_asset_limit,
+                rate_limits_share_pct=rate_limits_share_pct,
+                gateway_config=gateway_config,
             )
 
             # collect trading pairs from the gateway connector settings
@@ -67,7 +96,7 @@ class UserBalances:
             UserBalances.__instance = self
         self._markets = {}
 
-    async def add_exchange(self, exchange, client_config_map: ClientConfigMap, **api_details) -> Optional[str]:
+    async def add_exchange(self, exchange, client_config_map: Union[ClientConfigAdapter, ClientConfigMap, None], **api_details) -> Optional[str]:
         self._markets.pop(exchange, None)
         is_gateway_market = self.is_gateway_market(exchange)
         if not is_gateway_market:
@@ -84,7 +113,7 @@ class UserBalances:
             return {}
         return self._markets[exchange].get_all_balances()
 
-    async def update_exchange_balance(self, exchange_name: str, client_config_map: ClientConfigMap) -> Optional[str]:
+    async def update_exchange_balance(self, exchange_name: str, client_config_map: Union[ClientConfigAdapter, ClientConfigMap, None]) -> Optional[str]:
         is_gateway_market = self.is_gateway_market(exchange_name)
         if is_gateway_market and exchange_name in self._markets:
             # we want to refresh gateway connectors always, since the applicable tokens change over time.
@@ -100,7 +129,7 @@ class UserBalances:
     # returns error message for each exchange
     async def update_exchanges(
         self,
-        client_config_map: ClientConfigMap,
+        client_config_map: Union[ClientConfigAdapter, ClientConfigMap, None],
         reconnect: bool = False,
         exchanges: Optional[List[str]] = None
     ) -> Dict[str, Optional[str]]:
@@ -125,7 +154,7 @@ class UserBalances:
         return {ex: err_msg for ex, err_msg in zip(exchanges, results)}
 
     # returns only for non-gateway connectors since balance command no longer reports gateway connector balances
-    async def all_balances_all_exchanges(self, client_config_map: ClientConfigMap) -> Dict[str, Dict[str, Decimal]]:
+    async def all_balances_all_exchanges(self, client_config_map: Union[ClientConfigAdapter, ClientConfigMap, None]) -> Dict[str, Dict[str, Decimal]]:
         await self.update_exchanges(client_config_map)
         return {k: v.get_all_balances() for k, v in sorted(self._markets.items(), key=lambda x: x[0]) if not self.is_gateway_market(k)}
 
@@ -133,7 +162,7 @@ class UserBalances:
     def all_available_balances_all_exchanges(self) -> Dict[str, Dict[str, Decimal]]:
         return {k: v.available_balances for k, v in sorted(self._markets.items(), key=lambda x: x[0]) if not self.is_gateway_market(k)}
 
-    async def balances(self, exchange, client_config_map: ClientConfigMap, *symbols) -> Dict[str, Decimal]:
+    async def balances(self, exchange, client_config_map: Union[ClientConfigAdapter, ClientConfigMap, None], *symbols) -> Dict[str, Decimal]:
         if await self.update_exchange_balance(exchange, client_config_map) is None:
             results = {}
             for token, bal in self.all_balances(exchange).items():

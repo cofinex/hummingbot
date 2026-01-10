@@ -266,8 +266,28 @@ class AllConnectorSettings:
                     util_module_path: str = f"hummingbot.connector.{type_dir.name}." \
                                             f"{connector_dir.name}.{connector_dir.name}_utils"
                     util_module = importlib.import_module(util_module_path)
-                except ModuleNotFoundError:
-                    continue
+                except (ModuleNotFoundError, AttributeError, ImportError) as e:
+                    # Skip connectors with import errors (missing dependencies, version mismatches, etc.)
+                    # For circular import errors during discovery, try to continue anyway
+                    error_str = str(e).lower()
+                    is_circular_import = any(keyword in error_str for keyword in [
+                        "trade_fee_schema_loader", "tradefeeschemaloader",
+                        "partially initialized", "circular import"
+                    ])
+
+                    if is_circular_import:
+                        # For circular import errors, log and skip (these are often transient)
+                        import logging
+                        logging.getLogger().warning(
+                            f"Skipping {connector_dir.name} connector due to circular import during discovery. "
+                            f"This may be transient and the connector should work after discovery completes."
+                        )
+                        continue
+                    else:
+                        # For other import errors, log and skip
+                        import logging
+                        logging.getLogger().warning(f"Skipping {connector_dir.name} connector due to import error: {e}")
+                        continue
                 trade_fee_settings: List[float] = getattr(util_module, "DEFAULT_FEES", None)
                 trade_fee_schema: TradeFeeSchema = cls._validate_trade_fee_schema(
                     connector_dir.name, trade_fee_settings

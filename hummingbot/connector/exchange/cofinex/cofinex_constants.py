@@ -14,16 +14,30 @@ from hummingbot.core.api_throttler.data_types import RateLimit
 EXCHANGE_NAME = "cofinex"
 DEFAULT_DOMAIN = "main"
 
-# Base URLs - TODO: Update with actual Cofinex API endpoints
+# Order ID configuration
+HBOT_ORDER_ID_PREFIX = "x-CFNX"
+MAX_ORDER_ID_LEN = 32
+
+# Base URLs
+# Market data API (public endpoints)
+MARKET_DATA_BASE_URL = {
+    "main": "https://marketdata.cofinex.io",
+    # Add testnet if available
+    # "testnet": "https://marketdata-testnet.cofinex.io",
+}
+
+# Trade Engine API (private endpoints)
+# Production default: https://tradeapi1.cofinex.io
+# Can be overridden via config (cofinex_rest_api_base_url) for local testing
 BASE_PATH_URL = {
-    "main": "https://api.cofinex.com",
+    "main": "https://tradeapi1.cofinex.io",
     # Add testnet if available
     # "testnet": "https://api-testnet.cofinex.com",
 }
 
 # WebSocket URLs
 WS_BASE_URL = {
-    "main": "wss://api.cofinex.com/ws",
+    "main": "wss://wss1.cofinex.io/api/v1/ws/1",
     # "testnet": "wss://api-testnet.cofinex.com/ws",
 }
 
@@ -34,12 +48,12 @@ OAUTH_SCOPE = "openid"
 OAUTH_GRANT_TYPE = "password"
 TOKEN_REFRESH_BUFFER_SECONDS = 300  # Refresh 5 minutes before expiry (tokens last 5 hours)
 
-# REST API Endpoints - TODO: Update with actual Cofinex Trade Engine API endpoints
-# Note: These are placeholder paths - need actual Cofinex Trade Engine API paths
+# REST API Endpoints
+# Public endpoints (Market Data API)
+TRADING_PAIRS_PATH_URL = "/spot/v1/tradepair"  # Get all trading pairs
+ORDER_BOOK_PATH_URL = "/spot/v1/orderbook"  # Get order book for a trading pair (format: /spot/v1/orderbook/{SYMBOL}?depth=50&level=3)
 SERVER_TIME_PATH_URL = "/api/v1/time"
-SYMBOLS_PATH_URL = "/api/v1/symbols"
 TICKER_PATH_URL = "/api/v1/ticker"
-ORDER_BOOK_PATH_URL = "/api/v1/depth"
 TRADES_PATH_URL = "/api/v1/trades"
 EXCHANGE_INFO_PATH_URL = "/api/v1/exchangeInfo"
 
@@ -137,9 +151,9 @@ RATE_LIMITS = [
     RateLimit(limit_id=WS_CONNECTION_LIMIT_ID, limit=5, time_interval=ONE_MINUTE),
     RateLimit(limit_id=WS_SUBSCRIPTION_LIMIT_ID, limit=200, time_interval=ONE_SECOND),
 
-    # Public endpoints - TODO: Update with actual limits
+    # Public endpoints - Market Data API
+    RateLimit(limit_id=TRADING_PAIRS_PATH_URL, limit=10, time_interval=ONE_MINUTE),  # Limit trading pairs requests
     RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=NO_LIMIT, time_interval=ONE_SECOND),
-    RateLimit(limit_id=SYMBOLS_PATH_URL, limit=NO_LIMIT, time_interval=ONE_SECOND),
     RateLimit(limit_id=TICKER_PATH_URL, limit=NO_LIMIT, time_interval=ONE_SECOND),
     RateLimit(limit_id=ORDER_BOOK_PATH_URL, limit=NO_LIMIT, time_interval=ONE_SECOND),
     RateLimit(limit_id=TRADES_PATH_URL, limit=NO_LIMIT, time_interval=ONE_SECOND),

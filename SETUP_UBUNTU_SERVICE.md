@@ -239,7 +239,11 @@ Before enabling the service, test that the command works manually:
 /home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 
 # Or if you have a config password set:
-/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -p "your_password" -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+# Note: If password contains special characters (!, $, etc.), use single quotes or escape them:
+/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -p 'your_password' -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+# Or use environment variable to avoid shell interpretation:
+# export CONFIG_PASSWORD="your_password"
+# /home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 
 # Or test Option 2
 source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
@@ -252,7 +256,10 @@ source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hu
   ```bash
   -p "your_password"
   ```
-  - Or set it via environment variable: `export CONFIG_PASSWORD="your_password"`
+  - **Important for passwords with special characters (`!`, `$`, etc.):**
+    - Use **single quotes** instead of double quotes: `-p 'Minis@001!'`
+    - Or escape special characters: `-p "Minis@001\!"`
+    - Or use environment variable (recommended): `export CONFIG_PASSWORD="Minis@001!"` then run without `-p`
   - If you haven't set a password, the code will try an empty password automatically
 - When using `-f` and `-c` flags, the strategy **automatically connects** to the exchange specified in the config file
   - No manual `connect` command needed - the strategy's `init_markets` method handles this

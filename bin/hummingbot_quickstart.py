@@ -104,9 +104,11 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
     init_logging("hummingbot_logs.yml", client_config_map)
     await read_system_configs_from_yml()
 
-    # Automatically enable MQTT autostart for headless mode
-    if args.headless:
-        client_config_map.mqtt_bridge.mqtt_autostart = True
+    # MQTT is optional in headless mode - only enable if explicitly configured
+    # Script strategies can run without MQTT, so we don't force it
+    # If user wants MQTT, they can set mqtt_autostart: true in conf_client.yml
+    # if args.headless:
+    #     client_config_map.mqtt_bridge.mqtt_autostart = True
 
     AllConnectorSettings.initialize_paper_trade_settings(client_config_map.paper_trade.paper_trade_exchanges)
 

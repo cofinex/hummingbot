@@ -275,9 +275,24 @@ def main():
     secrets_manager_cls = ETHKeyFileSecretManger
     client_config_map = load_client_config_map_from_file()
     if args.config_password is None:
-        secrets_manager = login_prompt(secrets_manager_cls, style=load_style(client_config_map))
-        if not secrets_manager:
-            return
+        # In headless mode, we can't prompt for password - try empty string first
+        if args.headless:
+            # Try empty password first (for cases where no password was set)
+            secrets_manager = secrets_manager_cls("")
+            if not Security.login(secrets_manager):
+                # If empty password fails, user must provide password via -p flag
+                logging.getLogger().error(
+                    "ERROR: Password required for headless mode!\n"
+                    "Please provide your config password using the -p flag:\n"
+                    "  python bin/hummingbot_quickstart.py --headless -p \"your_password\" -f ... -c ...\n"
+                    "Or set it via environment variable:\n"
+                    "  export CONFIG_PASSWORD=\"your_password\""
+                )
+                raise SystemExit(1)
+        else:
+            secrets_manager = login_prompt(secrets_manager_cls, style=load_style(client_config_map))
+            if not secrets_manager:
+                return
     else:
         secrets_manager = secrets_manager_cls(args.config_password)
 

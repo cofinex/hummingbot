@@ -20,11 +20,13 @@ Environment="CONDA_DEFAULT_ENV=hummingbot"
 # Command to start Hummingbot
 # Option 1: Using conda run with headless mode (recommended for services)
 # Add --headless flag to run without interactive UI
-# Add -p "your_password" if you have a config password set
-ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+# If you set a config password, add -p "your_password" (or use environment variable CONFIG_PASSWORD)
+# If no password was set, the code will automatically try an empty password
+#ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 
 # Option 1b: With config password (if you set one)
-# ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -p "your_password" -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+# Uncomment and replace "your_password" with your actual password
+ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -p "your_password" -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 
 # Option 2: Using conda activate (alternative - uncomment if Option 1 doesn't work)
 # ExecStart=/bin/bash -c 'source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml'

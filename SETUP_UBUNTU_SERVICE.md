@@ -248,6 +248,12 @@ source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hu
 **Important Notes:**
 - The `--headless` flag is **required** when running as a service (no interactive terminal)
   - Without it, you'll get `EOFError` because the login prompt requires a terminal
+- **Config Password:** If you set a password for your encrypted config files, you must provide it via the `-p` flag:
+  ```bash
+  -p "your_password"
+  ```
+  - Or set it via environment variable: `export CONFIG_PASSWORD="your_password"`
+  - If you haven't set a password, the code will try an empty password automatically
 - When using `-f` and `-c` flags, the strategy **automatically connects** to the exchange specified in the config file
   - No manual `connect` command needed - the strategy's `init_markets` method handles this
 - **For live trading** (`exchange: cofinex`):

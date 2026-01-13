@@ -235,12 +235,29 @@ sudo nano /etc/systemd/system/hummingbot.service
 Before enabling the service, test that the command works manually:
 
 ```bash
-# Test Option 1
-/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+# Test Option 1 (with --headless flag - required for non-interactive execution)
+/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+
+# Or if you have a config password set:
+/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -p "your_password" -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 
 # Or test Option 2
-source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 ```
+
+**Important Notes:**
+- The `--headless` flag is **required** when running as a service (no interactive terminal)
+  - Without it, you'll get `EOFError` because the login prompt requires a terminal
+- When using `-f` and `-c` flags, the strategy **automatically connects** to the exchange specified in the config file
+  - No manual `connect` command needed - the strategy's `init_markets` method handles this
+- **For live trading** (`exchange: cofinex`):
+  - Credentials must be configured in `conf/connectors/cofinex.yml` (username and password)
+  - The credentials are encrypted and stored securely
+  - The strategy will automatically use these credentials when connecting
+- **For paper trading** (`exchange: cofinex_paper_trade`):
+  - No credentials needed - paper trading is simulated
+  - Make sure your config file has `exchange: cofinex_paper_trade`
+- The exchange connection happens automatically when the strategy starts via `initialize_markets()`
 
 If the command works, press Ctrl+C to stop it.
 

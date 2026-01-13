@@ -7,8 +7,8 @@ Wants=network.target
 [Service]
 Type=simple
 # Replace with your actual username
-User=YOUR_USERNAME
-Group=YOUR_USERNAME
+User=ubuntu
+Group=ubuntu
 
 # Working directory - adjust path to your Hummingbot installation
 WorkingDirectory=/home/YOUR_USERNAME/hummingbot
@@ -18,11 +18,16 @@ Environment="PATH=/home/YOUR_USERNAME/anaconda3/bin:/home/YOUR_USERNAME/minicond
 Environment="CONDA_DEFAULT_ENV=hummingbot"
 
 # Command to start Hummingbot
-# Option 1: Using conda run (recommended)
-ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+# Option 1: Using conda run with headless mode (recommended for services)
+# Add --headless flag to run without interactive UI
+# Add -p "your_password" if you have a config password set
+ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+
+# Option 1b: With config password (if you set one)
+# ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py --headless -p "your_password" -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
 
 # Option 2: Using conda activate (alternative - uncomment if Option 1 doesn't work)
-# ExecStart=/bin/bash -c 'source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml'
+# ExecStart=/bin/bash -c 'source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py --headless -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml'
 
 # Stop command
 ExecStop=/bin/kill -TERM $MAINPID

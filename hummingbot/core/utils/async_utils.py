@@ -1,11 +1,13 @@
 import asyncio
-import inspect
 import logging
 import time
 
 
 async def safe_wrapper(c):
     try:
+        # Debug logging to see if safe_wrapper is being called
+        coro_name = getattr(c, '__name__', str(c))
+        logging.getLogger(__name__).debug(f"safe_wrapper called with coroutine: {coro_name}")
         return await c
     except asyncio.CancelledError:
         raise
@@ -26,6 +28,7 @@ async def safe_gather(*args, **kwargs):
 
 
 async def wait_til(condition_func, timeout=10):
+    import inspect
     start_time = time.perf_counter()
     while True:
         if condition_func():

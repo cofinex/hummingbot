@@ -1,0 +1,50 @@
+[Unit]
+Description=Hummingbot Trading Bot
+Documentation=https://docs.hummingbot.org/
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+# Replace with your actual username
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+
+# Working directory - adjust path to your Hummingbot installation
+WorkingDirectory=/home/YOUR_USERNAME/hummingbot
+
+# Environment setup for conda
+Environment="PATH=/home/YOUR_USERNAME/anaconda3/bin:/home/YOUR_USERNAME/miniconda3/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="CONDA_DEFAULT_ENV=hummingbot"
+
+# Command to start Hummingbot
+# Option 1: Using conda run (recommended)
+ExecStart=/home/YOUR_USERNAME/anaconda3/bin/conda run -n hummingbot python bin/hummingbot_quickstart.py -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml
+
+# Option 2: Using conda activate (alternative - uncomment if Option 1 doesn't work)
+# ExecStart=/bin/bash -c 'source /home/YOUR_USERNAME/anaconda3/etc/profile.d/conda.sh && conda activate hummingbot && python bin/hummingbot_quickstart.py -f multi_level_self_trading.py -c conf/scripts/conf_multi_level_self_trading.yml'
+
+# Stop command
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hummingbot
+
+# Security settings (optional but recommended)
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Resource limits (optional)
+LimitNOFILE=65536
+
+# Environment file (optional - create this file to set environment variables)
+# EnvironmentFile=-/home/YOUR_USERNAME/hummingbot/.env
+
+[Install]
+WantedBy=multi-user.target

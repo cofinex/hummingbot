@@ -5,6 +5,7 @@ This module provides utilities for making HTTP requests to the Cofinex API,
 including rate limiting, time synchronization, and API factory creation.
 """
 
+import json
 from typing import Callable, Optional
 
 from hummingbot.connector.exchange.cofinex import cofinex_constants as CONSTANTS
@@ -13,8 +14,39 @@ from hummingbot.connector.utils import TimeSynchronizerRESTPreProcessor
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.utils.tracking_nonce import get_tracking_nonce
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+class CofinexRESTPreProcessor(RESTPreProcessorBase):
+    """
+    REST pre-processor for Cofinex API
+
+    Handles form-urlencoded data by converting JSON-encoded strings back to dicts,
+    allowing aiohttp to properly URL-encode them.
+
+    Similar to BitstampRESTPreProcessor - when Content-Type is application/x-www-form-urlencoded,
+    converts the JSON-encoded data back to a dict so aiohttp can URL-encode it.
+    """
+    CONTENT_TYPE_HEADER = "Content-Type"
+
+    async def pre_process(self, request: RESTRequest) -> RESTRequest:
+        # Check if Content-Type header indicates form-urlencoded
+        content_type = request.headers.get(self.CONTENT_TYPE_HEADER, "").lower() if request.headers else ""
+
+        # If Content-Type is form-urlencoded and we have data, convert JSON string back to dict
+        if content_type == "application/x-www-form-urlencoded" and request.data:
+            # rest_assistant converts the data dictionary to json but we need a urlencoded string instead
+            # the actual url encoding of this is done by aiohttp.
+            # Convert the JSON-encoded string back to a dict
+            if isinstance(request.data, str):
+                try:
+                    request.data = json.loads(request.data)
+                except (json.JSONDecodeError, TypeError):
+                    # If it's already a dict or not JSON, leave it as is
+                    pass
+        return request
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN, rest_api_base_url: Optional[str] = None) -> str:
@@ -78,6 +110,7 @@ def build_api_factory(
         throttler=throttler,
         auth=auth,
         rest_pre_processors=[
+            CofinexRESTPreProcessor(),
             TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
         ])
     return api_factory
@@ -86,12 +119,18 @@ def build_api_factory(
 def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncThrottler) -> WebAssistantsFactory:
     """
     Creates a WebAssistantsFactory without time synchronizer pre-processor
+    But includes CofinexRESTPreProcessor for form-urlencoded support (needed for OAuth token requests)
 
     :param throttler: Throttler for rate limiting
 
     :return: WebAssistantsFactory
     """
-    api_factory = WebAssistantsFactory(throttler=throttler)
+    api_factory = WebAssistantsFactory(
+        throttler=throttler,
+        rest_pre_processors=[
+            CofinexRESTPreProcessor(),  # Include pre-processor for form-urlencoded support (OAuth token requests)
+        ]
+    )
     return api_factory
 
 
@@ -126,15 +165,19 @@ async def get_current_server_time(
             method=RESTMethod.GET,
             throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
         )
-        # TODO: Adjust based on actual Cofinex API response format
-        # Common formats: {"serverTime": 1234567890} or {"timestamp": 1234567890} or {"data": 1234567890}
+        # Cofinex API response format: {"serverTime": 1768066395444}
+        # serverTime is in milliseconds (Unix timestamp)
         if isinstance(response, dict):
-            # Try different possible keys
-            server_time = response.get("serverTime") or response.get("timestamp") or response.get("data")
+            # Primary format: {"serverTime": 1768066395444}
+            server_time = response.get("serverTime")
             if server_time is None:
-                # If response is just a number
-                server_time = response
-            return float(server_time) / 1000.0  # Convert to seconds if in milliseconds
+                # Fallback formats (for compatibility)
+                server_time = response.get("timestamp") or response.get("data")
+                if server_time is None:
+                    # If response is just a number (shouldn't happen with Cofinex)
+                    server_time = response
+            return float(server_time) / 1000.0  # Convert milliseconds to seconds
+        # If response is not a dict, try to parse as number directly
         return float(response) / 1000.0
     except Exception:
         # Fallback to local time if server time unavailable

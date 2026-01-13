@@ -1,0 +1,59 @@
+# Multi-Level Self-Trading Strategy Configuration
+# For use with Cofinex Paper Trade
+
+# Exchange and Trading Pair
+exchange: cofinex
+trading_pair: CNX-USDT
+
+# Order Settings
+order_levels: 3                 # Number of order levels (changed from 5 to 3)
+level_spread: 0.002             # 0.2% spread between levels
+                                # For CNX at ~$0.23: 0.2% = ~$0.00046 per level
+
+# Level 1 Order Amount (in base currency CNX)
+level1_order_amount: 65.00      # Level 1: $15 per order (for self-trading)
+                                # For CNX at ~$0.23: 65 CNX ≈ $15.00
+
+# Levels 2-3 Order Amount Ranges (in USD value)
+# Set to $15 for all levels (min = max = 15)
+level2_5_buy_min_usd: 15        # Buy orders: $15
+level2_5_buy_max_usd: 15        # Buy orders: $15
+level2_5_sell_min_usd: 15       # Sell orders: $15
+level2_5_sell_max_usd: 15       # Sell orders: $15
+
+# Level 1 Self-Trading Settings
+# These offsets create overlapping orders for self-trading
+level1_buy_offset: 0.002       # Buy offset: 0.2% above reference
+                                # For CNX at ~$0.23: 0.2% = ~$0.00046
+level1_sell_offset: -0.002     # Sell offset: 0.2% below reference
+                                # For CNX at ~$0.23: 0.2% = ~$0.00046
+
+# Dynamic Price Shift from Bitget
+# Strategy fetches change24h from Bitget and uses it as price shift
+price_shift_enabled: true
+bitget_api_url: "https://api.bitget.com/api/v2/spot/market/tickers"
+bitget_symbol: "BTCUSDT"        # Bitget symbol for BTC/USDT
+price_shift_update_interval: 60 # Update every 60 seconds
+price_shift_multiplier: 1.0     # Use change24h as-is (1.0 = 100%, 2.0 = 200%, etc.)
+price_shift_change_threshold: 0.01  # Refresh if Bitget shift changes by >= 0.01%
+                                    # Lower = more sensitive, Higher = less frequent refreshes
+                                    # Recommended: 0.05-0.2% range
+
+# Strategy Settings (BALANCED CONFIGURATION)
+order_refresh_time: 300         # Refresh orders every 300s (5 minutes) if no fills occur
+                                # Backup timer to ensure maximum drift is capped
+filled_order_delay: 30          # Wait 30s after fill before refreshing orders (balanced)
+                                # Allows market interaction while maintaining responsiveness
+price_type: "last"               # ✅ PAPER TRADING: Uses real exchange mid-price (best for paper trading)
+                                #    More stable reference, tracks real market conditions
+                                #    Not affected by your self-trades (which don't update real exchange order book)
+                                #    For live trading with exchange-core: Use "last" (self-trades WILL move price)
+enable_self_trading: true       # Enable Level 1 self-trading (overlapping orders)
+
+# Refresh Control (NEW)
+refresh_on_level1_fill: true    # Refresh after Level 1 self-trades
+                                # In paper trading: Replenishes orders (price doesn't move with self-trades)
+                                # In live trading: Moves market price with self-trades
+                                # Set to false to prevent refresh after Level 1 fills
+refresh_on_level2_5_fill: true  # Refresh after Levels 2-3 fills (real market activity)
+                                # Set to false to reduce order churn

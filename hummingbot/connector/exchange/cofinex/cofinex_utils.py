@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -51,7 +52,35 @@ class CofinexConfigMap(BaseConnectorConfigMap):
         },
     )
 
-    model_config = ConfigDict(title="cofinex")
+    cofinex_ws_prefix: Optional[str] = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Enter WebSocket namespace prefix for local testing (e.g., 'dev:santosh'). Leave empty for production.",
+            "is_secure": False,
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        }
+    )
+
+    cofinex_rest_api_base_url: Optional[str] = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Enter REST API base URL for local testing (e.g., 'http://localhost:8001'). Leave empty for production (https://tradeapi1.cofinex.io).",
+            "is_secure": False,
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        }
+    )
+
+    # Override parent's extra="forbid" to allow optional fields
+    model_config = ConfigDict(
+        title="cofinex",
+        extra="allow",  # Allow extra fields for optional config like ws_prefix and rest_api_base_url
+        validate_assignment=True,
+        json_encoders={
+            datetime: lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S"),  # Preserve parent's json_encoders
+        }
+    )
 
     @field_validator("cofinex_username", mode="before")
     @classmethod

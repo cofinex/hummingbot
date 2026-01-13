@@ -12,8 +12,7 @@ Authentication Flow:
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
-from urllib.parse import urlencode
+from typing import Optional
 
 from hummingbot.connector.exchange.cofinex import cofinex_constants as CONSTANTS
 from hummingbot.core.web_assistant.auth import AuthBase
@@ -51,6 +50,7 @@ class CofinexAuth(AuthBase):
         client_id: str = CONSTANTS.OAUTH_CLIENT_ID,
         scope: str = CONSTANTS.OAUTH_SCOPE,
         api_factory: Optional[WebAssistantsFactory] = None,
+        oauth_token_url: Optional[str] = None,
     ):
         """
         Initialize Cofinex OAuth authentication
@@ -60,13 +60,16 @@ class CofinexAuth(AuthBase):
             password: Cofinex account password
             client_id: OAuth client ID (default: "cofinex-exchange")
             scope: OAuth scope (default: "openid")
-            api_factory: WebAssistantsFactory for making token requests
+            api_factory: WebAssistantsFactory for making token requests (optional)
+            oauth_token_url: OAuth token URL (default: production URL, can be overridden for local testing)
         """
         self.username = username
         self.password = password
         self.client_id = client_id
         self.scope = scope
         self._api_factory = api_factory
+        # Use provided OAuth token URL or fall back to production
+        self._oauth_token_url = oauth_token_url or CONSTANTS.OAUTH_TOKEN_URL
 
         # Token management
         self._access_token: Optional[str] = None
@@ -97,12 +100,10 @@ class CofinexAuth(AuthBase):
             Valid access token
 
         Raises:
-            ValueError: If API factory is not set
             Exception: If token request fails
         """
-        if not self._api_factory:
-            raise ValueError("API factory not set. Cannot request token. Call set_api_factory() first.")
-
+        # Note: _api_factory is optional - _request_new_token() creates its own factory
+        # But we still set it if available for throttling/configuration consistency
         async with self._token_lock:
             # Check if token is valid and not expired
             current_time = time.time()
@@ -142,6 +143,7 @@ class CofinexAuth(AuthBase):
             rest_assistant = await temp_api_factory.get_rest_assistant()
 
             # Prepare form data for OAuth token request (x-www-form-urlencoded)
+            # Pass as dict - the REST pre-processor will handle conversion to form-urlencoded
             form_data = {
                 "username": self.username,
                 "password": self.password,
@@ -155,14 +157,14 @@ class CofinexAuth(AuthBase):
                 "Content-Type": "application/x-www-form-urlencoded"
             }
 
-            self.logger().info("Requesting new access token from OAuth endpoint...")
+            self.logger().info(f"Requesting new access token from OAuth endpoint: {self._oauth_token_url}")
 
             response = await rest_assistant.execute_request(
-                url=CONSTANTS.OAUTH_TOKEN_URL,
+                url=self._oauth_token_url,
                 method=RESTMethod.POST,
-                data=urlencode(form_data),
+                data=form_data,  # Pass dict, not URL-encoded string - pre-processor handles it
                 headers=headers,
-                throttler_limit_id=CONSTANTS.OAUTH_TOKEN_URL,
+                throttler_limit_id=self._oauth_token_url,
             )
 
             # Parse OAuth response
@@ -215,7 +217,8 @@ class CofinexAuth(AuthBase):
             )
             rest_assistant = await temp_api_factory.get_rest_assistant()
 
-            # Prepare refresh token request
+            # Prepare refresh token request (x-www-form-urlencoded)
+            # Pass as dict - the REST pre-processor will handle conversion to form-urlencoded
             form_data = {
                 "client_id": self.client_id,
                 "grant_type": "refresh_token",
@@ -226,14 +229,14 @@ class CofinexAuth(AuthBase):
                 "Content-Type": "application/x-www-form-urlencoded"
             }
 
-            self.logger().info("Refreshing access token...")
+            self.logger().info(f"Refreshing access token from OAuth endpoint: {self._oauth_token_url}")
 
             response = await rest_assistant.execute_request(
-                url=CONSTANTS.OAUTH_TOKEN_URL,
+                url=self._oauth_token_url,
                 method=RESTMethod.POST,
-                data=urlencode(form_data),
+                data=form_data,  # Pass dict, not URL-encoded string - pre-processor handles it
                 headers=headers,
-                throttler_limit_id=CONSTANTS.OAUTH_TOKEN_URL,
+                throttler_limit_id=self._oauth_token_url,
             )
 
             # Update tokens

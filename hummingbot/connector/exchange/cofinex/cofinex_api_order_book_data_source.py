@@ -109,7 +109,8 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         # TODO: Implement actual price fetching from Cofinex API
         # This typically involves calling a ticker endpoint
-        _log_with_timestamp(f"[COFINEX OBS] get_last_traded_prices ENTRY for {len(trading_pairs)} pairs: {trading_pairs}")
+        # Commented out verbose logging - fires too frequently
+        # _log_with_timestamp(f"[COFINEX OBS] get_last_traded_prices ENTRY for {len(trading_pairs)} pairs: {trading_pairs}")
         prices: Dict[str, float] = {}
         order_books = {}
         if self._connector is not None:
@@ -137,7 +138,8 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().warning(f"Error computing last price for {trading_pair}: {e}")
         if not prices:
             await asyncio.sleep(1.0)
-        _log_with_timestamp(f"[COFINEX OBS] get_last_traded_prices EXIT with {len(prices)} prices")
+        # Commented out verbose logging - fires too frequently
+        # _log_with_timestamp(f"[COFINEX OBS] get_last_traded_prices EXIT with {len(prices)} prices")
         return prices
 
     async def get_new_order_book(self, trading_pair: str) -> OrderBook:
@@ -654,11 +656,33 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 # Convert timestamp from milliseconds to seconds
                 if timestamp_raw:
-                    if isinstance(timestamp_raw, str):
-                        timestamp_ms = int(timestamp_raw)
-                    else:
-                        timestamp_ms = int(timestamp_raw)
-                    timestamp = float(timestamp_ms) / 1000.0
+                    try:
+                        if isinstance(timestamp_raw, str):
+                            # Handle simple numeric string
+                            timestamp_ms = int(timestamp_raw)
+                        else:
+                            timestamp_ms = int(timestamp_raw)
+                        timestamp = float(timestamp_ms) / 1000.0
+                    except (ValueError, TypeError):
+                        # Handle unexpected formats (e.g., "48-0-1768113862502-1768113852654-0")
+                        # Try to extract the largest numeric value which is likely the timestamp
+                        self.logger().warning(f"Unexpected timestamp format: {timestamp_raw}, attempting to parse")
+                        try:
+                            if isinstance(timestamp_raw, str):
+                                # Extract all numeric parts and use the largest one (likely the timestamp)
+                                parts = timestamp_raw.split("-")
+                                numeric_parts = [int(p) for p in parts if p.isdigit()]
+                                if numeric_parts:
+                                    timestamp_ms = max(numeric_parts)  # Use the largest value
+                                    timestamp = float(timestamp_ms) / 1000.0
+                                else:
+                                    raise ValueError("No numeric parts found")
+                            else:
+                                timestamp_ms = int(timestamp_raw)
+                                timestamp = float(timestamp_ms) / 1000.0
+                        except (ValueError, TypeError) as e:
+                            self.logger().warning(f"Failed to parse timestamp '{timestamp_raw}': {e}, using current time")
+                            timestamp = time.time()
                 else:
                     timestamp = time.time()
 

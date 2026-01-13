@@ -78,47 +78,28 @@ class OrderBookTracker:
         }
 
     def start(self):
-        import sys
-        import time
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() ENTRY", file=sys.stderr, flush=True)
         self.logger().info("OrderBookTracker.start() called")
 
         self.stop()
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() stop() completed", file=sys.stderr, flush=True)
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _init_order_books_task", file=sys.stderr, flush=True)
         self._init_order_books_task = safe_ensure_future(
             self._init_order_books()
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _emit_trade_event_task", file=sys.stderr, flush=True)
         self._emit_trade_event_task = safe_ensure_future(
             self._emit_trade_event_loop()
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _order_book_diff_listener_task", file=sys.stderr, flush=True)
         self._order_book_diff_listener_task = safe_ensure_future(
             self._data_source.listen_for_order_book_diffs(self._ev_loop, self._order_book_diff_stream)
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _order_book_trade_listener_task", file=sys.stderr, flush=True)
         self._order_book_trade_listener_task = safe_ensure_future(
             self._data_source.listen_for_trades(self._ev_loop, self._order_book_trade_stream)
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _order_book_snapshot_listener_task", file=sys.stderr, flush=True)
-        self.logger().info("Creating _order_book_snapshot_listener_task")
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] About to call listen_for_order_book_snapshots", file=sys.stderr, flush=True)
-
         # Create the coroutine first
         coro = self._data_source.listen_for_order_book_snapshots(self._ev_loop, self._order_book_snapshot_stream)
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] Coroutine created: {coro}", file=sys.stderr, flush=True)
 
         # Create the task
         task = safe_ensure_future(coro)
@@ -126,52 +107,34 @@ class OrderBookTracker:
 
         # Add callback to log when task completes or raises exception
         def task_done_callback(fut):
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             if fut.cancelled():
-                print(f"[{timestamp}] [ORDER_BOOK_TRACKER] Snapshot listener task CANCELLED", file=sys.stderr, flush=True)
                 self.logger().warning("Snapshot listener task was cancelled")
             elif fut.exception():
                 exc = fut.exception()
-                print(f"[{timestamp}] [ORDER_BOOK_TRACKER] Snapshot listener task EXCEPTION: {exc}", file=sys.stderr, flush=True)
                 self.logger().error(f"Snapshot listener task raised exception: {exc}", exc_info=True)
-            else:
-                result = fut.result()
-                print(f"[{timestamp}] [ORDER_BOOK_TRACKER] Snapshot listener task COMPLETED: {result}", file=sys.stderr, flush=True)
-                self.logger().info(f"Snapshot listener task completed: {result}")
+            # Note: Don't log completion as it's noisy - tasks complete normally
 
         task.add_done_callback(task_done_callback)
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] _order_book_snapshot_listener_task created: {task}", file=sys.stderr, flush=True)
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] Task done: {task.done()}, cancelled: {task.cancelled()}", file=sys.stderr, flush=True)
-        self.logger().info(f"_order_book_snapshot_listener_task created: {task}")
+        # Commented out verbose log - task creation is already logged above
+        # self.logger().info(f"_order_book_snapshot_listener_task created: {task}")
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _order_book_stream_listener_task", file=sys.stderr, flush=True)
         self._order_book_stream_listener_task = safe_ensure_future(
             self._data_source.listen_for_subscriptions()
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _order_book_diff_router_task", file=sys.stderr, flush=True)
         self._order_book_diff_router_task = safe_ensure_future(
             self._order_book_diff_router()
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _order_book_snapshot_router_task", file=sys.stderr, flush=True)
         self._order_book_snapshot_router_task = safe_ensure_future(
             self._order_book_snapshot_router()
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() creating _update_last_trade_prices_task", file=sys.stderr, flush=True)
         self._update_last_trade_prices_task = safe_ensure_future(
             self._update_last_trade_prices_loop()
         )
 
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] [ORDER_BOOK_TRACKER] start() EXIT - all tasks created", file=sys.stderr, flush=True)
         self.logger().info("OrderBookTracker.start() completed - all tasks created")
 
     def stop(self):

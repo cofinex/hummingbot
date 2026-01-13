@@ -479,6 +479,17 @@ class ExchangePyBase(ExchangeBase, ABC):
             **kwargs,
         )
 
+        # Validate: Check if exchange_order_id is already being tracked (Exchange-Core bug)
+        existing_order = self._order_tracker.fetch_order(exchange_order_id=exchange_order_id)
+        if existing_order and existing_order.client_order_id != order.client_order_id:
+            self.logger().error(
+                f"⚠️  DUPLICATE exchange_order_id detected! "
+                f"Order {order.client_order_id} received exchange_order_id {exchange_order_id}, "
+                f"but this ID is already assigned to order {existing_order.client_order_id}. "
+                f"This is likely an Exchange-Core bug where order IDs are reused. "
+                f"Both orders may be tracked incorrectly."
+            )
+
         order_update: OrderUpdate = OrderUpdate(
             client_order_id=order.client_order_id,
             exchange_order_id=str(exchange_order_id),
@@ -717,9 +728,9 @@ class ExchangePyBase(ExchangeBase, ABC):
             self._user_stream_tracker_task.cancel()
             self._user_stream_tracker_task = None
 
-        # Stop the user stream tracker to properly clean up child tasks
+        # Stop the user stream tracker to properly clean up child tasks (synchronous, like OrderBookTracker)
         if self._user_stream_tracker is not None:
-            await self._user_stream_tracker.stop()
+            self._user_stream_tracker.stop()
         if self._user_stream_event_listener_task is not None:
             self._user_stream_event_listener_task.cancel()
             self._user_stream_event_listener_task = None
@@ -853,7 +864,18 @@ class ExchangePyBase(ExchangeBase, ABC):
         return UserStreamTracker(data_source=self._create_user_stream_data_source())
 
     def _create_user_stream_tracker_task(self):
-        return safe_ensure_future(self._user_stream_tracker.start())
+        """Create and start the user stream tracker task (synchronous, like OrderBookTracker)."""
+        # Commented out verbose debug logging
+        # self.logger().info(f"ExchangePyBase._create_user_stream_tracker_task() called - tracker: {self._user_stream_tracker}")
+        if self._user_stream_tracker is None:
+            self.logger().warning("_create_user_stream_tracker_task() called but _user_stream_tracker is None!")
+            return None
+        # Call start() directly (it's now synchronous like OrderBookTracker.start())
+        self._user_stream_tracker.start()
+        task = self._user_stream_tracker._user_stream_tracking_task
+        # Commented out verbose debug logging
+        # self.logger().info(f"_create_user_stream_tracker_task() - tracker started, task: {task}")
+        return task
 
     # === Exchange / Trading logic methods that call the API ===
 

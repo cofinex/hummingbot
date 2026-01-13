@@ -6,6 +6,7 @@ It uses OAuth 2.0 authentication, so it requires username and password
 instead of API key and secret key.
 """
 
+from datetime import datetime
 from typing import Optional
 
 from pydantic import ConfigDict, Field, SecretStr, field_validator
@@ -77,7 +78,15 @@ class CofinexConfigMap(BaseConnectorConfigMap):
         }
     )
 
-    model_config = ConfigDict(title="cofinex")
+    # Override parent's extra="forbid" to allow optional fields
+    model_config = ConfigDict(
+        title="cofinex",
+        extra="allow",  # Allow extra fields for optional config like ws_prefix and rest_api_base_url
+        validate_assignment=True,
+        json_encoders={
+            datetime: lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S"),  # Preserve parent's json_encoders
+        }
+    )
 
     @field_validator("connector", mode="before")
     @classmethod
@@ -110,7 +119,12 @@ class CofinexConfigMap(BaseConnectorConfigMap):
         """Validate username format (should be email)"""
         if not v or len(v.strip()) == 0:
             raise ValueError("Username cannot be empty")
-        # Basic email validation
+        # Skip validation if value looks encrypted (starts with '7b' which is hex for '{')
+        # This allows encrypted values from config files to pass validation
+        if v.startswith("7b") and len(v) > 100:
+            # Likely encrypted value, skip email validation
+            return v
+        # Basic email validation for plain text values
         if "@" not in v:
             raise ValueError("Username should be an email address")
         return v

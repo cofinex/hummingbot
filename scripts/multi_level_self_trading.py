@@ -13,6 +13,7 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
@@ -25,34 +26,55 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
     trading_pair: str = Field("BTC-USDT", description="Trading pair to trade")
 
     # Order settings
-    order_levels: int = Field(5, description="Number of order levels (default: 5)")
+    order_levels: int = Field(15, description="Number of order levels (default: 15)")
     level_spread: Decimal = Field(
         Decimal("0.002"),
         description="Spread between levels (0.2% = 0.002, default: 0.2%)"
     )
 
-    # Level 1 order amount (in base currency)
-    level1_order_amount: Decimal = Field(
-        Decimal("43.48"),
-        description="Level 1 order amount in base currency (e.g., CNX) - typically $10 worth"
+    # Level 1 order value (in USD)
+    level1_order_value_usd: Decimal = Field(
+        Decimal("100"),
+        description="Level 1 order value in USD (amount will be calculated dynamically based on price)"
     )
 
-    # Levels 2-5 order amount ranges (in USD)
-    level2_5_buy_min_usd: Decimal = Field(
+    # Normal order amount ranges (in USD)
+    # Used for levels 2 through (large_level_sell_start - 1) for SELL
+    # Used for ALL levels 2+ for BUY
+    normal_buy_min_usd: Decimal = Field(
         Decimal("10"),
-        description="Minimum buy order value in USD for levels 2-5"
+        description="Minimum buy order value in USD for all levels 2+"
     )
-    level2_5_buy_max_usd: Decimal = Field(
+    normal_buy_max_usd: Decimal = Field(
         Decimal("50"),
-        description="Maximum buy order value in USD for levels 2-5"
+        description="Maximum buy order value in USD for all levels 2+"
     )
-    level2_5_sell_min_usd: Decimal = Field(
-        Decimal("500"),
-        description="Minimum sell order value in USD for levels 2-5"
+    normal_sell_min_usd: Decimal = Field(
+        Decimal("1000"),
+        description="Minimum sell order value in USD for levels 2+ up to large_level_sell_start-1"
     )
-    level2_5_sell_max_usd: Decimal = Field(
-        Decimal("1500"),
-        description="Maximum sell order value in USD for levels 2-5"
+    normal_sell_max_usd: Decimal = Field(
+        Decimal("5000"),
+        description="Maximum sell order value in USD for levels 2+ up to large_level_sell_start-1"
+    )
+
+    # Large level SELL configuration
+    # Levels from large_level_sell_start to order_levels will use these settings
+    large_level_sell_start: int = Field(
+        13,
+        description="First level to use large spacing (e.g., 13 means levels 13+ use large spacing). Set to 0 or > order_levels to disable."
+    )
+    large_level_sell_spread_multiplier: Decimal = Field(
+        Decimal("200"),
+        description="Multiplier for level_spread on large-level sell orders (e.g., 200 = 200x = 40% per level)"
+    )
+    large_level_sell_min_usd: Decimal = Field(
+        Decimal("5000"),
+        description="Minimum sell order value in USD for large levels (from large_level_sell_start to order_levels)"
+    )
+    large_level_sell_max_usd: Decimal = Field(
+        Decimal("10000"),
+        description="Maximum sell order value in USD for large levels (from large_level_sell_start to order_levels)"
     )
 
     # Level 1 self-trading settings
@@ -102,7 +124,7 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
     )
     refresh_on_level2_5_fill: bool = Field(
         True,
-        description="Refresh orders after Levels 2-5 fills (real market activity, default: True)"
+        description="Refresh orders after Levels 2+ fills (real market activity, default: True)"
     )
 
 
@@ -154,6 +176,9 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         self.last_shift_update_timestamp = 0
         self.refresh_pending = False
 
+        # Track last trade price internally (for paper trading where connector doesn't track it)
+        self._last_trade_price: Optional[Decimal] = None
+
         # Initialize precision as None - will be detected lazily when connector is ready
         self._price_precision: Optional[int] = None
         self._amount_precision: Optional[int] = None
@@ -164,15 +189,21 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         self.logger().info("Multi-Level Self-Trading Strategy initialized")
         self.logger().info(f"Exchange: {config.exchange}, Pair: {config.trading_pair}")
         self.logger().info(f"Levels: {config.order_levels}, Level Spread: {config.level_spread}")
-        self.logger().info(f"Level 1 Order Amount: {config.level1_order_amount} (base currency)")
-        self.logger().info(f"Levels 2-5 Buy Range: ${config.level2_5_buy_min_usd}-${config.level2_5_buy_max_usd}")
-        self.logger().info(f"Levels 2-5 Sell Range: ${config.level2_5_sell_min_usd}-${config.level2_5_sell_max_usd}")
+        self.logger().info(f"Level 1 Order Value: ${config.level1_order_value_usd} USDT (amount calculated dynamically)")
+        self.logger().info(f"Normal Buy Range: ${config.normal_buy_min_usd}-${config.normal_buy_max_usd} (all levels 2+)")
+        self.logger().info(f"Normal Sell Range: ${config.normal_sell_min_usd}-${config.normal_sell_max_usd} (levels 2+ up to {config.large_level_sell_start - 1 if config.large_level_sell_start > 0 else config.order_levels})")  # noqa: E226
+        if config.large_level_sell_start > 0 and config.large_level_sell_start <= config.order_levels:
+            self.logger().info(f"Large Level Sell: Levels {config.large_level_sell_start}-{config.order_levels}")
+            self.logger().info(f"  - Range: ${config.large_level_sell_min_usd}-${config.large_level_sell_max_usd}")
+            self.logger().info(f"  - Spacing Multiplier: {config.large_level_sell_spread_multiplier}x ({config.large_level_sell_spread_multiplier * config.level_spread * 100:.1f}% per level)")
+        else:
+            self.logger().info("Large Level Sell: Disabled")
         self.logger().info(f"Dynamic Price Shift: Enabled={config.price_shift_enabled}")
         if config.price_shift_enabled:
             self.logger().info(f"Bitget Symbol: {config.bitget_symbol}")
             self.logger().info(f"Shift Update Interval: {config.price_shift_update_interval}s")
             self.logger().info(f"Shift Change Threshold: {config.price_shift_change_threshold}% (triggers refresh)")
-        self.logger().info(f"Fill Delay: {config.filled_order_delay}s | Refresh Level 1: {config.refresh_on_level1_fill} | Refresh Level 2-5: {config.refresh_on_level2_5_fill}")
+        self.logger().info(f"Fill Delay: {config.filled_order_delay}s | Refresh Level 1: {config.refresh_on_level1_fill} | Refresh Level 2+: {config.refresh_on_level2_5_fill}")
         self.logger().info(f"Price Type: {config.price_type} (use 'last' for self-trade price movement)")
         self.logger().info("Precision will be detected once connector is ready")
 
@@ -529,6 +560,20 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
             self._refresh_orders()
             # Note: create_timestamp is now set inside _refresh_orders() after successful placement
 
+        # Check if orders were cancelled externally (paper trading timeout, etc.)
+        # If we expected to have orders but they're missing, place new ones
+        elif self.create_timestamp > 0:  # We've placed orders before
+            active_orders = self.get_active_orders(self.config.exchange)
+            expected_order_count = self.config.order_levels * 2  # Buy + Sell per level
+
+            # If we have significantly fewer orders than expected, something cancelled them
+            if len(active_orders) < expected_order_count * 0.5:  # Less than half of expected
+                self.logger().warning(
+                    f"Detected missing orders: Expected ~{expected_order_count}, found {len(active_orders)}. "
+                    f"Orders may have been cancelled externally. Placing new orders..."
+                )
+                self._refresh_orders()
+
     async def _fetch_bitget_change24h(self):
         """
         Fetch change24h from Bitget API and update price shift
@@ -624,8 +669,8 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         # Adjust proposal based on available budget
         proposal_adjusted: List[OrderCandidate] = self._adjust_proposal_to_budget(proposal)
 
-        # Place orders
-        self._place_orders(proposal_adjusted)
+        # Place orders with 10ms delay between each to avoid Exchange-Core duplicate order ID issues
+        safe_ensure_future(self._place_orders(proposal_adjusted))
 
         # Log order placement summary
         buy_orders = [o for o in proposal_adjusted if o.order_side == TradeType.BUY]
@@ -649,13 +694,26 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         - change24h from Bitget (e.g., 0.00309)
         - Convert to percentage: 0.00309 * 100 = 0.309%
         - Apply as shift: reference = base_price * (1 + 0.309/100)
+
+        Note: If LastTrade price is not available (e.g., no trades yet), falls back to MidPrice
         """
         connector = self.connectors[self.config.exchange]
 
         try:
             base_price = connector.get_price_by_type(self.config.trading_pair, self.price_source)
+
+            # If LastTrade price is not available from connector (e.g., paper trading doesn't track it)
+            # First try our internally tracked last trade price, then fall back to MidPrice
+            if (base_price is None or base_price.is_nan()) and self.price_source == PriceType.LastTrade:
+                if self._last_trade_price is not None:
+                    self.logger().debug(f"Using internally tracked last trade price: {self._last_trade_price:.{self.price_precision}f}")
+                    base_price = self._last_trade_price
+                else:
+                    self.logger().info(f"Last trade price not available (no fills yet), falling back to mid price for {self.config.trading_pair}")
+                    base_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
+
             if base_price is None or base_price.is_nan():
-                self.logger().warning(f"Could not get {self.price_source} price for {self.config.trading_pair}")
+                self.logger().warning(f"Could not get price for {self.config.trading_pair} (tried {self.price_source})")
                 return None
 
             # Apply dynamic price shift from Bitget
@@ -754,13 +812,56 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                 f"(No overlap)"
             )
 
-        # Create Level 1 orders (fixed amount from config)
+        # Create Level 1 orders (amount calculated dynamically to ensure $100 USDT value)
+        # Calculate amount based on reference price to ensure it's always worth level1_order_value_usd
+        level1_order_amount = self.config.level1_order_value_usd / ref_price
+
+        # Quantize the amount using connector's quantization method
+        try:
+            level1_order_amount = quantize_connector.quantize_order_amount(
+                self.config.trading_pair, level1_order_amount
+            )
+        except (KeyError, AttributeError):
+            level1_order_amount = connector.quantize_order_amount(
+                self.config.trading_pair, level1_order_amount
+            )
+
+        # Ensure minimum notional is met (add a small buffer)
+        min_notional = Decimal("10")  # Default minimum
+        try:
+            if hasattr(quantize_connector, '_trading_rules') and self.config.trading_pair in quantize_connector._trading_rules:
+                trading_rule = quantize_connector._trading_rules[self.config.trading_pair]
+                if hasattr(trading_rule, 'min_notional_size'):
+                    min_notional = trading_rule.min_notional_size
+        except Exception:
+            pass  # Use default if can't get trading rule
+
+        # Verify the order value meets minimum notional
+        order_value = level1_order_amount * ref_price
+        if order_value < min_notional:
+            # Increase amount to meet minimum notional
+            level1_order_amount = (min_notional * Decimal("1.1")) / ref_price  # 10% buffer
+            try:
+                level1_order_amount = quantize_connector.quantize_order_amount(
+                    self.config.trading_pair, level1_order_amount
+                )
+            except (KeyError, AttributeError):
+                level1_order_amount = connector.quantize_order_amount(
+                    self.config.trading_pair, level1_order_amount
+                )
+
+        self.logger().info(
+            f"Level 1 order amount: {level1_order_amount:.{self.amount_precision}f} "
+            f"(target: ${self.config.level1_order_value_usd} USDT, "
+            f"actual: ${level1_order_amount * ref_price:.2f} USDT @ {ref_price:.{self.price_precision}f})"
+        )
+
         orders.append(OrderCandidate(
             trading_pair=self.config.trading_pair,
             is_maker=True,
             order_type=OrderType.LIMIT,
             order_side=TradeType.BUY,
-            amount=self.config.level1_order_amount,
+            amount=level1_order_amount,
             price=level1_buy_price
         ))
 
@@ -769,18 +870,51 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
             is_maker=True,
             order_type=OrderType.LIMIT,
             order_side=TradeType.SELL,
-            amount=self.config.level1_order_amount,
+            amount=level1_order_amount,
             price=level1_sell_price
         ))
 
-        # Levels 2-5: Different amounts for buy and sell
-        for level in range(2, self.config.order_levels + 1):
-            # Calculate spread from level 1
-            level_offset = (level - 1) * self.config.level_spread
+        # Levels 2+: Config-driven order amounts and spacing
+        # Calculate relative to reference price (not Level 1) to maintain proper spacing
+        # Level 1 uses special offsets for self-trading overlap, but Levels 2+ use config-driven spacing
+        large_spacing_enabled = (self.config.large_level_sell_start > 0 and
+                                 self.config.large_level_sell_start <= self.config.order_levels)
 
-            # Buy orders go below level 1, sell orders go above level 1
-            level_buy_price = level1_buy_price * (Decimal("1") - level_offset)
-            level_sell_price = level1_sell_price * (Decimal("1") + level_offset)
+        for level in range(2, self.config.order_levels + 1):
+            # Determine if this level uses large spacing for SELL orders
+            use_large_spacing_sell = large_spacing_enabled and level >= self.config.large_level_sell_start
+
+            # Calculate price spacing for SELL orders
+            if use_large_spacing_sell:
+                # Large spacing: additive from previous level (each level = previous level + increment)
+                prev_level = level - 1
+                # Calculate previous level's sell price
+                if prev_level < self.config.large_level_sell_start:
+                    # Previous level uses normal spacing
+                    prev_level_offset = (prev_level - 1) * self.config.level_spread
+                    prev_level_sell_price = ref_price * (Decimal("1") + prev_level_offset)
+                else:
+                    # Previous level is also a large level - calculate it recursively
+                    # For any large level M: calculate all previous large levels
+                    first_large_level_offset = (self.config.large_level_sell_start - 1) * self.config.level_spread
+                    first_large_level_normal_price = ref_price * (Decimal("1") + first_large_level_offset)
+                    large_spread_increment = self.config.large_level_sell_spread_multiplier * self.config.level_spread * ref_price
+                    first_large_level_price = first_large_level_normal_price + large_spread_increment
+                    # Previous level's price: first large level + (prev_level - large_level_sell_start) increments
+                    num_prev_increments = prev_level - self.config.large_level_sell_start
+                    prev_level_sell_price = first_large_level_price + (num_prev_increments * large_spread_increment)
+
+                # Current level: previous level + increment
+                large_spread_increment = self.config.large_level_sell_spread_multiplier * self.config.level_spread * ref_price
+                level_sell_price = prev_level_sell_price + large_spread_increment
+            else:
+                # Normal spacing: cumulative offset from reference price
+                level_offset = (level - 1) * self.config.level_spread
+                level_sell_price = ref_price * (Decimal("1") + level_offset)
+
+            # Buy orders always use normal spacing (go below reference price)
+            level_offset = (level - 1) * self.config.level_spread
+            level_buy_price = ref_price * (Decimal("1") - level_offset)
 
             # Quantize prices
             try:
@@ -790,19 +924,25 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                 level_buy_price = connector.quantize_order_price(self.config.trading_pair, level_buy_price)
                 level_sell_price = connector.quantize_order_price(self.config.trading_pair, level_sell_price)
 
-            # Calculate order amounts based on USD value ranges
-            # Buy orders: $10-$50 range
+            # Calculate order amounts based on USD value ranges (config-driven)
+            # Buy orders: always use normal range
             buy_usd_value = Decimal(str(random.uniform(
-                float(self.config.level2_5_buy_min_usd),
-                float(self.config.level2_5_buy_max_usd)
+                float(self.config.normal_buy_min_usd),
+                float(self.config.normal_buy_max_usd)
             )))
             buy_amount = buy_usd_value / level_buy_price  # Convert USD to base currency
 
-            # Sell orders: $500-$1500 range
-            sell_usd_value = Decimal(str(random.uniform(
-                float(self.config.level2_5_sell_min_usd),
-                float(self.config.level2_5_sell_max_usd)
-            )))
+            # Sell orders: use large range if this is a large level, otherwise normal range
+            if use_large_spacing_sell:
+                sell_usd_value = Decimal(str(random.uniform(
+                    float(self.config.large_level_sell_min_usd),
+                    float(self.config.large_level_sell_max_usd)
+                )))
+            else:
+                sell_usd_value = Decimal(str(random.uniform(
+                    float(self.config.normal_sell_min_usd),
+                    float(self.config.normal_sell_max_usd)
+                )))
             sell_amount = sell_usd_value / level_sell_price  # Convert USD to base currency
 
             # Quantize amounts to exchange precision
@@ -814,11 +954,12 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                 sell_amount = connector.quantize_order_amount(self.config.trading_pair, sell_amount)
 
             # Log order details
+            spacing_type = "LARGE" if use_large_spacing_sell else "normal"
             self.logger().info(
                 f"Level {level}: Buy {buy_amount:.{self.amount_precision}f} @ {level_buy_price:.{self.price_precision}f} "
                 f"(${buy_usd_value:.2f}) | "
                 f"Sell {sell_amount:.{self.amount_precision}f} @ {level_sell_price:.{self.price_precision}f} "
-                f"(${sell_usd_value:.2f})"
+                f"(${sell_usd_value:.2f}) [{spacing_type}]"
             )
 
             orders.append(OrderCandidate(
@@ -866,13 +1007,17 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
 
         return [o for o in adjusted if o.amount > 0]  # Filter out zero-amount orders
 
-    def _place_orders(self, proposal: List[OrderCandidate]) -> None:
+    async def _place_orders(self, proposal: List[OrderCandidate]) -> None:
         """
-        Place orders from proposal
+        Place orders from proposal with 10ms delay between each order
+        to avoid Exchange-Core duplicate order ID issues
         """
         for order in proposal:
             if order.amount > 0:
                 self._place_order(connector_name=self.config.exchange, order=order)
+                # Add 10ms delay between orders to prevent Exchange-Core duplicate order ID bug
+                # This ensures orders are placed in different milliseconds
+                await asyncio.sleep(0.01)
 
     def _place_order(self, connector_name: str, order: OrderCandidate):
         """
@@ -914,16 +1059,28 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
     def _is_level1_fill(self, event: OrderFilledEvent) -> bool:
         """
         Determine if a fill is likely from Level 1 (self-trade)
+        Checks if fill price is within Level 1 offset range from reference price
         """
         try:
             ref_price = self._get_reference_price()
             if ref_price:
-                price_diff = abs(event.price - ref_price) / ref_price
-                # Level 1 is within half the level_spread from reference
-                is_level1 = price_diff < (self.config.level_spread * Decimal("0.5"))
+                # Level 1 orders are placed at ref_price ± level1_offset
+                # Check if fill price is within the Level 1 offset range
+                price_diff_pct = abs(event.price - ref_price) / ref_price
+
+                # Use the maximum of the absolute offsets to determine Level 1 range
+                max_level1_offset = max(
+                    abs(self.config.level1_buy_offset),
+                    abs(self.config.level1_sell_offset)
+                )
+
+                # Add a small tolerance (10% of offset) to account for price quantization
+                tolerance = max_level1_offset * Decimal("0.1")
+                is_level1 = price_diff_pct <= (max_level1_offset + tolerance)
+
                 return is_level1
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger().debug(f"Error checking Level 1 fill: {e}")
         return False
 
     def did_fill_order(self, event: OrderFilledEvent):
@@ -933,6 +1090,12 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         """
         self.total_fills += 1
         self.last_fill_timestamp = self.current_timestamp
+
+        # Track last trade price internally (for paper trading where connector doesn't track it)
+        # This allows "last" price type to work in paper trading
+        if self.config.price_type == "last":
+            self._last_trade_price = Decimal(str(event.price))
+            self.logger().debug(f"Updated internal last trade price: {self._last_trade_price:.{self.price_precision}f}")
 
         # Check if this is likely a Level 1 fill (self-trade)
         is_level1 = self._is_level1_fill(event)
@@ -955,15 +1118,15 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                     "Level 1 fill - refresh_on_level1_fill=False, NOT refreshing (prevents price contamination)"
                 )
         else:
-            # Level 2-5 fill (real market activity)
+            # Level 2+ fill (real market activity)
             if self.config.refresh_on_level2_5_fill:
                 self.refresh_pending = True
                 self.logger().info(
-                    f"Level 2-5 fill (real market activity) - will refresh in {self.config.filled_order_delay}s"
+                    f"Level 2+ fill (real market activity) - will refresh in {self.config.filled_order_delay}s"
                 )
             else:
                 self.logger().info(
-                    "Level 2-5 fill - refresh_on_level2_5_fill=False, NOT refreshing"
+                    "Level 2+ fill - refresh_on_level2_5_fill=False, NOT refreshing"
                 )
 
         msg = (

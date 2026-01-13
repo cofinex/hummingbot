@@ -9,6 +9,7 @@ TODO: Implement all the methods based on Cofinex API documentation
 """
 
 import asyncio
+import decimal
 import os
 import sys
 import threading
@@ -25,6 +26,7 @@ from hummingbot.connector.exchange.cofinex.cofinex_auth import CofinexAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
+from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.limit_order import LimitOrder
@@ -70,6 +72,7 @@ class CofinexExchange(ExchangePyBase):
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         ws_prefix: Optional[str] = None,
+        **kwargs,  # Accept extra params like cofinex_ws_prefix, cofinex_rest_api_base_url (handled from config map)
     ):
         """
         Initialize Cofinex exchange connector
@@ -93,38 +96,55 @@ class CofinexExchange(ExchangePyBase):
         self._cofinex_password = cofinex_password if cofinex_password and cofinex_password.strip() else None
 
         # Handle WebSocket prefix and REST API base URL
-        # Priority: 1) Parameter, 2) Config map, 3) Environment variable
+        # Priority: 1) Parameter, 2) kwargs (from config map), 3) Config map, 4) Environment variable
         from hummingbot.client.config.security import Security
 
-        # Try to read from config map (for both "cofinex" and "cofinex_paper_trade", config is under "cofinex")
-        connector_config = Security.decrypted_value("cofinex")
+        # Check kwargs first (when passed from config map initialization)
+        if ws_prefix is None and "cofinex_ws_prefix" in kwargs:
+            ws_prefix = kwargs.pop("cofinex_ws_prefix")
+            if ws_prefix:
+                ws_prefix = ws_prefix.strip() if isinstance(ws_prefix, str) else None
+                if not ws_prefix:
+                    ws_prefix = None
 
+        # Try to read from config map (for both "cofinex" and "cofinex_paper_trade", config is under "cofinex")
+        connector_config = Security.decrypted_value("cofinex") if ws_prefix is None else None
+        if ws_prefix is None and connector_config is not None:
+            ws_prefix = getattr(connector_config.hb_config, "cofinex_ws_prefix", None)
+            if ws_prefix:
+                ws_prefix = ws_prefix.strip() if isinstance(ws_prefix, str) else None
+                if not ws_prefix:
+                    ws_prefix = None
+        # Fallback to environment variable
         if ws_prefix is None:
-            if connector_config is not None:
-                ws_prefix = getattr(connector_config.hb_config, "cofinex_ws_prefix", None)
-                if ws_prefix:
-                    ws_prefix = ws_prefix.strip() if isinstance(ws_prefix, str) else None
-                    if not ws_prefix:
-                        ws_prefix = None
-            # Fallback to environment variable
-            if ws_prefix is None:
-                ws_prefix = os.getenv("COFINEX_WS_PREFIX") or os.getenv("DEV_NAMESPACE")
-                if ws_prefix:
-                    ws_prefix = ws_prefix.strip()
-                    if not ws_prefix:
-                        ws_prefix = None
+            ws_prefix = os.getenv("COFINEX_WS_PREFIX") or os.getenv("DEV_NAMESPACE")
+            if ws_prefix:
+                ws_prefix = ws_prefix.strip()
+                if not ws_prefix:
+                    ws_prefix = None
 
         self._ws_prefix = ws_prefix  # Store it (can be None)
+        self._last_user_stream_init_log = 0.0
 
         # Handle REST API base URL
-        # Priority: 1) Config map, 2) Environment variable, 3) Default production URL
+        # Priority: 1) kwargs (from config map), 2) Config map, 3) Environment variable, 4) Default production URL
         rest_api_base_url = None
-        if connector_config is not None:
-            rest_api_base_url = getattr(connector_config.hb_config, "cofinex_rest_api_base_url", None)
+        if "cofinex_rest_api_base_url" in kwargs:
+            rest_api_base_url = kwargs.pop("cofinex_rest_api_base_url")
             if rest_api_base_url:
                 rest_api_base_url = rest_api_base_url.strip() if isinstance(rest_api_base_url, str) else None
                 if not rest_api_base_url:
                     rest_api_base_url = None
+
+        if rest_api_base_url is None:
+            if connector_config is None:
+                connector_config = Security.decrypted_value("cofinex")
+            if connector_config is not None:
+                rest_api_base_url = getattr(connector_config.hb_config, "cofinex_rest_api_base_url", None)
+                if rest_api_base_url:
+                    rest_api_base_url = rest_api_base_url.strip() if isinstance(rest_api_base_url, str) else None
+                    if not rest_api_base_url:
+                        rest_api_base_url = None
         # Fallback to environment variable
         if rest_api_base_url is None:
             rest_api_base_url = os.getenv("COFINEX_REST_API_BASE_URL")
@@ -145,8 +165,6 @@ class CofinexExchange(ExchangePyBase):
         # The trading_pair_symbol_map() property will call _initialize_trading_pair_symbol_map()
         # when accessed, but we need to make sure it's called with the correct trading pairs
         if self._trading_pairs and len(self._trading_pairs) > 0:
-            import sys
-            print(f"[COFINEX] __init__: Trading pairs set: {self._trading_pairs}", file=sys.stderr, flush=True)
             self.logger().info(f"Trading pairs configured in __init__: {self._trading_pairs}")
             # Reset symbol map to None so it will be re-initialized when accessed
             self._trading_pair_symbol_map = None
@@ -158,21 +176,12 @@ class CofinexExchange(ExchangePyBase):
                 # Schedule initialization as a background task
                 # This will use the per-pair endpoint since self._trading_pairs is now set
                 safe_ensure_future(self._initialize_trading_pair_symbol_map())
-                print("[COFINEX] __init__: Scheduled symbol map initialization task", file=sys.stderr, flush=True)
                 self.logger().info("Scheduled symbol map initialization with per-pair API")
             except Exception as e:
-                print(f"[COFINEX] __init__: Error scheduling initialization: {e}", file=sys.stderr, flush=True)
                 self.logger().warning(f"Could not schedule symbol map initialization: {e}")
 
-        # CRITICAL: Verify method resolution works
-        import sys
-        print(f"[COFINEX] __init__: type(self) = {type(self)}", file=sys.stderr, flush=True)
-        print(f"[COFINEX] __init__: hasattr(self, 'start_network') = {hasattr(self, 'start_network')}", file=sys.stderr, flush=True)
-        print(f"[COFINEX] __init__: self.start_network = {self.start_network}", file=sys.stderr, flush=True)
-        print(f"[COFINEX] __init__: self.start_network.__qualname__ = {getattr(self.start_network, '__qualname__', 'N/A')}", file=sys.stderr, flush=True)
-
-        # Authentication
-        self._auth: Optional[CofinexAuth] = None
+        # Authentication - Will be created by authenticator property when needed
+        # Note: Base class will set self._auth = self.authenticator in __init__, so don't overwrite it
 
         # Data storage
         self._order_books: Dict[str, OrderBook] = {}
@@ -181,10 +190,13 @@ class CofinexExchange(ExchangePyBase):
         self._account_balances: Dict[str, Decimal] = {}
 
         # Network tasks
+        # Note: _web_assistants_factory is created by base class __init__ via _create_web_assistants_factory()
+        # Note: _user_stream_tracker is created by base class __init__ via _create_user_stream_tracker()
+        # Do NOT overwrite them here!
         self._status_polling_task: Optional[asyncio.Task] = None
-        self._user_stream_tracker: Optional[Any] = None
+        # DO NOT set _user_stream_tracker to None - it's already created by super().__init__()
+        # self._user_stream_tracker is already initialized by ExchangePyBase.__init__()
         self._order_book_tracker: Optional[OrderBookTracker] = None
-        self._web_assistants_factory = None
 
         # Rate limiting
         self._last_request_time = 0
@@ -210,18 +222,43 @@ class CofinexExchange(ExchangePyBase):
 
     @property
     def authenticator(self):
-        """Return authenticator instance"""
+        """Return authenticator instance (cached)"""
         # For paper trading, return None
         if not self._trading_required:
             return None
+
+        # Cache the authenticator instance to avoid creating new ones each time
+        # Note: Base class sets self._auth = self.authenticator in __init__
+        # If it's already set and valid, reuse it
+        if hasattr(self, '_auth') and self._auth is not None:
+            return self._auth
+
         # If we have credentials, create auth instance
         if self._cofinex_username and self._cofinex_password:
-            # Note: api_factory will be set later in start_network
-            # For now, create auth without api_factory (it will be set later)
-            return CofinexAuth(
-                username=self._cofinex_username,
-                password=self._cofinex_password,
-            )
+            # Convert SecretStr to cleartext string (handles encrypted credentials from config)
+            username = self._cofinex_username
+            password = self._cofinex_password
+
+            # Extract cleartext from SecretStr (handles encrypted credentials)
+            if hasattr(username, 'get_secret_value'):
+                username = username.get_secret_value()
+            if hasattr(password, 'get_secret_value'):
+                password = password.get_secret_value()
+
+            # Convert to string if not already (handles edge cases)
+            username = str(username) if username else None
+            password = str(password) if password else None
+
+            if username and password:
+                # Note: api_factory will be set later in start_network
+                # For now, create auth without api_factory (it will be set later)
+                auth = CofinexAuth(
+                    username=username,
+                    password=password,
+                )
+                # Cache it
+                self._auth = auth
+                return auth
         return None
 
     @property
@@ -302,6 +339,35 @@ class CofinexExchange(ExchangePyBase):
             domain=self._domain,
         )
 
+    def _is_user_stream_initialized(self):
+        """
+        Check if user stream is initialized.
+
+        Override to handle the case where _user_stream_tracker might be None
+        (e.g., during initialization or if authentication fails).
+        """
+        now = time.time()
+        if now - self._last_user_stream_init_log >= 2.0:
+            # Check last receive time for logging (commented out verbose logging)
+            # _last_recv = (
+            #     None if self._user_stream_tracker is None else self._user_stream_tracker.data_source.last_recv_time
+            # )
+            # Commented out verbose logging - fires too frequently
+            # self.logger().info(
+            #     "User stream init check: tracker=%s last_recv_time=%s trading_required=%s",
+            #     self._user_stream_tracker,
+            #     last_recv,
+            #     self.is_trading_required,
+            # )
+            self._last_user_stream_init_log = now
+
+        if self._user_stream_tracker is None:
+            # If tracker is None, check if trading is required
+            # If not required, we can proceed without user stream
+            return not self.is_trading_required
+        # Normal check: tracker exists and has received data, or trading not required
+        return self._user_stream_tracker.data_source.last_recv_time > 0 or not self.is_trading_required
+
     # =============================================================================
     # REQUIRED ABSTRACT METHODS (stub implementations for now)
     # =============================================================================
@@ -322,8 +388,9 @@ class CofinexExchange(ExchangePyBase):
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         """Check if exception indicates order not found during cancellation"""
-        # TODO: Implement based on Cofinex error codes
-        return False
+        error_str = str(cancelation_exception)
+        # Check for 404 HTTP status or "Order not found" message
+        return "404" in error_str or "Order not found" in error_str or "not found" in error_str.lower()
 
     def _get_fee(self,
                  base_currency: str,
@@ -339,19 +406,293 @@ class CofinexExchange(ExchangePyBase):
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _request_order_status(self, tracked_order) -> Any:
-        """Request order status from exchange"""
-        # TODO: Implement order status request
-        raise NotImplementedError("Order status request not yet implemented")
+        """
+        Request order status from exchange.
+
+        Endpoint: GET /order/{orderId}
+
+        Response format:
+        {
+            "order": {
+                "order_id": 1768058112362,
+                "symbol_id": 12,
+                "symbol": "CNX/USDT",
+                "side": "SELL",
+                "order_type": "GTC",
+                "price": "0.1",
+                "size": "10",
+                "filled": "0",
+                "reserve_bid_price": 0.1,
+                "timestamp": 1768038316000,
+                "status": "OPEN"
+            },
+            "timestamp": "2026-01-10T20:45:32.729858"
+        }
+        """
+        exchange_order_id = tracked_order.exchange_order_id
+        if not exchange_order_id or exchange_order_id == "UNKNOWN":
+            self.logger().warning(f"Cannot request status for order {tracked_order.client_order_id} without exchange_order_id")
+            return None
+
+        try:
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+
+            # Make API request: GET /order/{orderId}
+            rest_api_base_url = getattr(self, "_rest_api_base_url", None)
+            url = web_utils.private_rest_url(
+                path_url=f"{CONSTANTS.ORDER_STATUS_PATH_URL}/{exchange_order_id}",
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
+
+            response = await rest_assistant.execute_request(
+                url=url,
+                method=RESTMethod.GET,
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.GET_ORDER_LIMIT_ID,
+            )
+
+            # Parse response
+            if not isinstance(response, dict):
+                self.logger().error(f"Invalid order status response format: {type(response)}")
+                return None
+
+            order_data = response.get("order")
+            if not order_data:
+                self.logger().warning(f"No order data in response for order_id: {exchange_order_id}")
+                return None
+
+            # Return order data in format expected by order tracker
+            # Convert to standard format
+            return {
+                "orderId": str(order_data.get("order_id", "")),
+                "clientOrderId": tracked_order.client_order_id,
+                "symbol": order_data.get("symbol", ""),
+                "side": order_data.get("side", ""),
+                "type": "LIMIT" if order_data.get("order_type") == "GTC" else order_data.get("order_type", "LIMIT"),
+                "quantity": order_data.get("size", "0"),
+                "price": order_data.get("price", "0"),
+                "executedQuantity": order_data.get("filled", "0"),
+                "status": self._parse_order_status(order_data.get("status", "")),
+                "timestamp": order_data.get("timestamp", 0),
+            }
+
+        except Exception as e:
+            self.logger().error(f"Error requesting order status for {exchange_order_id}: {e}", exc_info=True)
+            return None
+
+    def _parse_order_status(self, status: str) -> str:
+        """
+        Convert exchange order status to Hummingbot format.
+
+        Exchange statuses: "OPEN", "FILLED", "CANCELED", etc.
+        Hummingbot statuses: "NEW", "FILLED", "CANCELED", "PARTIALLY_FILLED", etc.
+        """
+        status_upper = status.upper() if status else ""
+
+        # Map exchange statuses to Hummingbot statuses
+        status_map = {
+            "OPEN": "NEW",
+            "NEW": "NEW",
+            "FILLED": "FILLED",
+            "CANCELED": "CANCELED",
+            "CANCELLED": "CANCELED",
+            "PARTIALLY_FILLED": "PARTIALLY_FILLED",
+            "REJECTED": "REJECTED",
+            "EXPIRED": "EXPIRED",
+        }
+
+        return status_map.get(status_upper, status_upper)
+
+    def _parse_order_status_to_state(self, status: str):
+        """
+        Convert order status string to OrderState enum.
+
+        Args:
+            status: Status string (e.g., "FILLED", "CANCELED", "NEW")
+
+        Returns:
+            OrderState enum value
+        """
+        from hummingbot.core.data_type.in_flight_order import OrderState
+
+        status_upper = status.upper() if status else ""
+
+        # Map status strings to OrderState enum
+        status_to_state = {
+            "NEW": OrderState.OPEN,
+            "OPEN": OrderState.OPEN,
+            "FILLED": OrderState.FILLED,
+            "CANCELED": OrderState.CANCELED,
+            "CANCELLED": OrderState.CANCELED,
+            "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
+            "REJECTED": OrderState.FAILED,
+            "EXPIRED": OrderState.CANCELED,
+        }
+
+        return status_to_state.get(status_upper, OrderState.OPEN)
+
+    def _create_trade_update_from_order_status(self, tracked_order: InFlightOrder, order_status_data: Dict[str, Any]):
+        """
+        Create a TradeUpdate from order status data when order is filled.
+
+        Args:
+            tracked_order: The InFlightOrder being tracked
+            order_status_data: Order status data from _request_order_status
+
+        Returns:
+            TradeUpdate object or None if data is insufficient
+        """
+        from hummingbot.core.data_type.in_flight_order import TradeUpdate
+
+        try:
+            executed_qty = Decimal(str(order_status_data.get("executedQuantity", "0")))
+            price = Decimal(str(order_status_data.get("price", "0")))
+
+            if executed_qty <= 0 or price <= 0:
+                return None
+
+            # Calculate fill amounts
+            fill_base_amount = executed_qty
+            fill_quote_amount = executed_qty * price
+
+            # Get fee (use estimated fee since order status doesn't provide fee details)
+            # For limit orders, assume maker fee
+            is_maker = tracked_order.order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+            fee = self._get_fee(
+                base_currency=tracked_order.base_asset,
+                quote_currency=tracked_order.quote_asset,
+                order_type=tracked_order.order_type,
+                order_side=tracked_order.trade_type,
+                amount=fill_base_amount,
+                price=price,
+                is_maker=is_maker
+            )
+
+            # Use exchange_order_id as trade_id if we don't have a specific trade ID
+            # This is a fallback - ideally we'd get actual trade IDs from the exchange
+            trade_id = f"{tracked_order.exchange_order_id}_fill"
+
+            # Use timestamp from order status, or current time as fallback
+            timestamp_ms = order_status_data.get("timestamp", 0)
+            fill_timestamp = float(timestamp_ms) / 1000.0 if timestamp_ms > 0 else time.time()
+
+            trade_update = TradeUpdate(
+                trade_id=trade_id,
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                fill_timestamp=fill_timestamp,
+                fill_price=price,
+                fill_base_amount=fill_base_amount,
+                fill_quote_amount=fill_quote_amount,
+                fee=fee,
+                is_taker=not is_maker,
+            )
+
+            return trade_update
+
+        except Exception as e:
+            self.logger().error(f"Error creating TradeUpdate from order status: {e}", exc_info=True)
+            return None
 
     async def _all_trade_updates_for_order(self, order) -> List[Any]:
         """Get all trade updates for an order"""
-        # TODO: Implement trade updates retrieval
+        # Try to get trade updates from order status
+        try:
+            order_status_data = await self._request_order_status(order)
+            if order_status_data:
+                trade_update = self._create_trade_update_from_order_status(order, order_status_data)
+                if trade_update:
+                    return [trade_update]
+        except Exception as e:
+            self.logger().debug(f"Could not get trade updates for order {order.client_order_id}: {e}")
+
         return []
+
+    def _convert_to_exchange_symbol(self, trading_pair: str) -> str:
+        """
+        Convert Hummingbot trading pair format (CNX-USDT) to exchange format (CNX/USDT).
+
+        Args:
+            trading_pair: Trading pair in Hummingbot format (e.g., "CNX-USDT")
+
+        Returns:
+            Trading pair in exchange format (e.g., "CNX/USDT")
+        """
+        return trading_pair.replace("-", "/")
 
     async def _update_balances(self):
         """Update account balances from exchange"""
-        # TODO: Implement balance update
-        pass
+        try:
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+
+            # Step 1: Sync balances first (POST /balances/sync)
+            rest_api_base_url = getattr(self, "_rest_api_base_url", None)
+            sync_url = web_utils.private_rest_url(
+                path_url=CONSTANTS.BALANCES_SYNC_PATH_URL,
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
+
+            try:
+                await rest_assistant.execute_request(
+                    url=sync_url,
+                    method=RESTMethod.POST,
+                    is_auth_required=True,
+                    throttler_limit_id=CONSTANTS.BALANCES_SYNC_PATH_URL,
+                )
+                # Don't process response - just trigger sync
+            except Exception as e:
+                self.logger().warning(f"Error syncing balances: {e}")
+
+            # Step 2: Get balances (GET /balances)
+            balances_url = web_utils.private_rest_url(
+                path_url=CONSTANTS.BALANCES_PATH_URL,
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
+
+            response = await rest_assistant.execute_request(
+                url=balances_url,
+                method=RESTMethod.GET,
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.BALANCES_PATH_URL,
+            )
+
+            # Parse response format:
+            # {
+            #     "user_id": 1120,
+            #     "balances": {
+            #         "USDT": {"balance": 6.775, "available": 6.775, "locked": 0.0},
+            #         "CNX": {"balance": 60.0, "available": 60.0, "locked": 0.0}
+            #     },
+            #     "timestamp": "2026-01-10T14:59:54.989630"
+            # }
+
+            if not isinstance(response, dict):
+                self.logger().error(f"Invalid balance response format: {type(response)}")
+                return
+
+            balances_data = response.get("balances", {})
+            if not balances_data:
+                self.logger().warning("No balances found in response")
+                return
+
+            # Update balances
+            for currency, balance_info in balances_data.items():
+                currency_upper = currency.upper()
+                available = Decimal(str(balance_info.get("available", "0")))
+                locked = Decimal(str(balance_info.get("locked", "0")))
+                total = available + locked
+
+                self._account_balances[currency_upper] = total
+                self._account_available_balances[currency_upper] = available
+
+            self.logger().info(f"Updated balances: {dict(self._account_balances)}")
+
+        except Exception as e:
+            self.logger().error(f"Error updating balances: {e}", exc_info=True)
 
     async def _update_trading_fees(self):
         """Update trading fees from exchange"""
@@ -359,12 +700,92 @@ class CofinexExchange(ExchangePyBase):
         pass
 
     async def _user_stream_event_listener(self):
-        """Listen to user stream events"""
-        # TODO: Implement user stream event listener
+        """
+        Listen to user stream events and process balance updates, order updates, etc.
+
+        This method processes events from the user stream data source (REST polling)
+        and updates the connector's internal state (balances, orders, etc.).
+        """
         async for event_message in self._iter_user_event_queue():
             try:
-                # Process events here
-                pass
+                event_type = event_message.get("event_type", "")
+
+                if event_type == "balance_update":
+                    # Process balance update event
+                    # Format: {
+                    #     "event_type": "balance_update",
+                    #     "data": {
+                    #         "currency": "USDT",
+                    #         "available": "6.775",
+                    #         "locked": "0.0",
+                    #         "total": "6.775"
+                    #     },
+                    #     "timestamp": 1768069347.880
+                    # }
+                    data = event_message.get("data", {})
+                    currency = data.get("currency", "").upper()
+                    if currency:
+                        available = Decimal(str(data.get("available", "0")))
+                        locked = Decimal(str(data.get("locked", "0")))
+                        total = available + locked
+
+                        self._account_balances[currency] = total
+                        self._account_available_balances[currency] = available
+
+                        self.logger().debug(
+                            f"Balance updated from user stream: {currency} = "
+                            f"available={available}, locked={locked}, total={total}"
+                        )
+
+                elif event_type == "order_update":
+                    # Process order update event
+                    data = event_message.get("data", {})
+                    order_id_str = str(data.get("order_id", ""))
+                    status = data.get("status", "").upper()
+
+                    # Find the tracked order by exchange_order_id
+                    tracked_order = None
+                    for client_id, in_flight_order in self._order_tracker.all_updatable_orders.items():
+                        if str(in_flight_order.exchange_order_id) == order_id_str:
+                            tracked_order = in_flight_order
+                            break
+
+                    if tracked_order:
+                        # Convert status to OrderState
+                        new_state = self._parse_order_status_to_state(status)
+
+                        # Create OrderUpdate
+                        from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+                        order_update = OrderUpdate(
+                            trading_pair=tracked_order.trading_pair,
+                            update_timestamp=event_message.get("timestamp", time.time()),
+                            new_state=new_state,
+                            client_order_id=tracked_order.client_order_id,
+                            exchange_order_id=order_id_str,
+                        )
+
+                        # If order is FILLED, create and process TradeUpdate first
+                        if new_state == OrderState.FILLED:
+                            # Query order status to get fill details
+                            try:
+                                order_status_data = await self._request_order_status(tracked_order)
+                                if order_status_data:
+                                    trade_update = self._create_trade_update_from_order_status(tracked_order, order_status_data)
+                                    if trade_update:
+                                        self._order_tracker.process_trade_update(trade_update)
+                                        self.logger().info(f"Order {tracked_order.client_order_id} (exchange_order_id: {order_id_str}) - processed trade fill event from user stream")
+                            except Exception as e:
+                                self.logger().warning(f"Could not create TradeUpdate for order {order_id_str}: {e}")
+
+                        # Process order update
+                        self._order_tracker.process_order_update(order_update)
+                        self.logger().debug(f"Order update processed: {tracked_order.client_order_id} -> {new_state.name}")
+                    else:
+                        self.logger().debug(f"Order update event for unknown order: {order_id_str}")
+
+                else:
+                    self.logger().debug(f"Unknown event type: {event_type}, message: {event_message}")
+
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -449,12 +870,29 @@ class CofinexExchange(ExchangePyBase):
 
                 hb_trading_pair = combine_to_hb_trading_pair(base=base_coin, quote=quote_coin)
 
-                min_order_size = Decimal(str(data.get("minTradeAmount", "0")))
-                max_order_size = Decimal(str(data.get("maxTradeAmount", "900000000000000000000")))
-                price_precision = int(data.get("pricePrecision", 0))
-                quantity_precision = int(data.get("quantityPrecision", 0))
-                quote_precision = int(data.get("quotePrecision", 0))
-                min_notional_size = Decimal(str(data.get("minTradeUSDT", "0")))
+                # Safely parse Decimal values - handle None and invalid values
+                def safe_decimal(value, default="0"):
+                    if value is None:
+                        return Decimal(default)
+                    try:
+                        return Decimal(str(value))
+                    except (ValueError, TypeError, decimal.InvalidOperation):
+                        return Decimal(default)
+
+                def safe_int(value, default=0):
+                    if value is None:
+                        return default
+                    try:
+                        return int(value)
+                    except (ValueError, TypeError):
+                        return default
+
+                min_order_size = safe_decimal(data.get("minTradeAmount"), "0")
+                max_order_size = safe_decimal(data.get("maxTradeAmount"), "900000000000000000000")
+                price_precision = safe_int(data.get("pricePrecision"), 0)
+                quantity_precision = safe_int(data.get("quantityPrecision"), 0)
+                quote_precision = safe_int(data.get("quotePrecision"), 0)
+                min_notional_size = safe_decimal(data.get("minTradeUSDT"), "0")
 
                 min_price_increment = Decimal("10") ** Decimal(-price_precision) if price_precision > 0 else Decimal("0")
                 min_base_amount_increment = Decimal("10") ** Decimal(-quantity_precision) if quantity_precision > 0 else Decimal("0")
@@ -495,8 +933,6 @@ class CofinexExchange(ExchangePyBase):
         Override to use per-pair endpoint instead of bulk endpoint.
         This only fetches trading rules for configured trading pairs.
         """
-        import sys
-        print(f"[COFINEX] _update_trading_rules called. trading_pairs={self._trading_pairs}", file=sys.stderr, flush=True)
         self.logger().info(f"Updating trading rules for {len(self._trading_pairs)} configured pairs: {self._trading_pairs}")
 
         try:
@@ -549,7 +985,6 @@ class CofinexExchange(ExchangePyBase):
             # Log all trading pair keys
             if self._trading_rules:
                 self.logger().info(f"Trading rules loaded for pairs: {list(self._trading_rules.keys())}")
-            print(f"[COFINEX] _update_trading_rules complete: {len(self._trading_rules)} rules", file=sys.stderr, flush=True)
 
         except Exception as e:
             self.logger().error(f"Error updating trading rules: {e}", exc_info=True)
@@ -576,10 +1011,11 @@ class CofinexExchange(ExchangePyBase):
     def ready(self) -> bool:
         """Override to add logging, while keeping base readiness logic."""
         result = super().ready
-        status = self.status_dict
-        import sys
-        print(f"[COFINEX] ready property called: {result}, status_dict: {status}", file=sys.stderr, flush=True)
-        self.logger().info(f"Connector ready status: {result}, details: {status}")
+        # status = self.status_dict  # Unused variable
+        # Commented out verbose logging - fires too frequently
+        # import sys
+        # print(f"[COFINEX] ready property called: {result}, status_dict: {status}", file=sys.stderr, flush=True)
+        # self.logger().info(f"Connector ready status: {result}, details: {status}")
         return result
 
     @property
@@ -615,43 +1051,14 @@ class CofinexExchange(ExchangePyBase):
         except Exception:
             pass  # Ignore file errors
 
-        print("=" * 80, file=sys.stderr, flush=True)
-        print("[COFINEX] start_network() METHOD ENTRY - FIRST LINE", file=sys.stderr, flush=True)
-        print("=" * 80, file=sys.stderr, flush=True)
-
-        # CRITICAL: Write to file FIRST before anything else
-        debug_file = "/tmp/cofinex_start_network.txt"
-        try:
-            with open(debug_file, "a") as f:
-                f.write(f"\n{'=' * 60}\n")
-                f.write(f"[{time.time()}] ========== start_network() CALLED ==========\n")
-                f.write(f"[{time.time()}] self._trading_pairs = {getattr(self, '_trading_pairs', 'NOT SET')}\n")
-                f.write(f"[{time.time()}] self.trading_pairs = {self.trading_pairs}\n")
-                f.write(f"[{time.time()}] type(self) = {type(self)}\n")
-                f.write(f"[{time.time()}] isinstance(self, CofinexExchange) = {isinstance(self, CofinexExchange)}\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception as e:
-            # Even if file write fails, try stderr
-            print(f"[COFINEX] ERROR writing to debug file: {e}", file=sys.stderr, flush=True)
-
-        # Also print to stderr immediately
-        print("[COFINEX] ========== start_network() CALLED ==========", file=sys.stderr, flush=True)
-        print(f"[COFINEX] self._trading_pairs = {getattr(self, '_trading_pairs', 'NOT SET')}", file=sys.stderr, flush=True)
-        print(f"[COFINEX] self.trading_pairs = {self.trading_pairs}", file=sys.stderr, flush=True)
-        print(f"[COFINEX] self._trading_required = {getattr(self, '_trading_required', 'NOT SET')}", file=sys.stderr, flush=True)
-
         self.logger().info("Starting Cofinex connector...")
         self.logger().info(f"Trading pairs: {self._trading_pairs}")
         self.logger().info(f"Trading required: {self._trading_required}")
 
         try:
             self._start_event_loop_watchdog()
-            print("[COFINEX] Starting network initialization...", file=sys.stderr, flush=True)
 
             # Initialize trading pair symbol map (needed for all operations)
-            print("[COFINEX] Step 1: Initializing trading pair symbol map...", file=sys.stderr, flush=True)
-            print(f"[COFINEX] Step 1: self._trading_pairs = {self._trading_pairs}", file=sys.stderr, flush=True)
             self.logger().info("Initializing trading pair symbol map...")
             self.logger().info(f"Trading pairs available: {self._trading_pairs}")
 
@@ -664,25 +1071,19 @@ class CofinexExchange(ExchangePyBase):
                 self.logger().warning("No trading pairs configured - skipping symbol map initialization")
 
             symbol_map = await self.trading_pair_symbol_map()
-            print(f"[COFINEX] Step 1 complete: {len(symbol_map)} pairs", file=sys.stderr, flush=True)
             self.logger().info(f"Trading pair symbol map initialized. Total pairs: {len(symbol_map)}")
 
             # Update trading rules (needed for order validation)
-            print("[COFINEX] Step 2: Updating trading rules...", file=sys.stderr, flush=True)
             self.logger().info("Updating trading rules...")
             await self._update_trading_rules()
-            print(f"[COFINEX] Step 2 complete: {len(self._trading_rules)} rules", file=sys.stderr, flush=True)
             self.logger().info(f"Trading rules updated. Total rules: {len(self._trading_rules)}")
 
             # Initialize authentication (if trading required)
             if self._trading_required:
-                print("[COFINEX] Step 3: Initializing authentication...", file=sys.stderr, flush=True)
                 self.logger().info("Initializing authentication...")
                 await self._initialize_auth()
-                print("[COFINEX] Step 3 complete: Authentication initialized", file=sys.stderr, flush=True)
                 self.logger().info("Authentication initialized")
             else:
-                print("[COFINEX] Step 3: Paper trading mode - skipping authentication", file=sys.stderr, flush=True)
                 self.logger().info("Paper trading mode: Skipping authentication")
 
             # Ensure trading rules are initialized before starting network
@@ -699,15 +1100,11 @@ class CofinexExchange(ExchangePyBase):
             # - Start user stream tracker and event listener
             import time
             step4_start = time.time()
-            print(f"[COFINEX] Step 4: Starting parent network components... (time: {time.strftime('%H:%M:%S')})", file=sys.stderr, flush=True)
             self.logger().info("Starting parent network components (order book tracker, polling tasks)...")
-            print("[COFINEX] Step 4: About to call super().start_network()", file=sys.stderr, flush=True)
             await super().start_network()
             step4_elapsed = time.time() - step4_start
-            print(f"[COFINEX] Step 4 complete: Parent network started in {step4_elapsed:.2f}s", file=sys.stderr, flush=True)
             self.logger().info(f"Parent network started in {step4_elapsed:.2f}s")
 
-            print("[COFINEX] All steps complete - connector started successfully", file=sys.stderr, flush=True)
             self.logger().info("Cofinex connector started successfully")
 
         except Exception as e:
@@ -721,23 +1118,16 @@ class CofinexExchange(ExchangePyBase):
         Override to add logging and timeout
         """
         import asyncio
-        import sys
-        print("=" * 80, file=sys.stderr, flush=True)
-        print("[COFINEX] check_network() METHOD ENTRY - FIRST LINE", file=sys.stderr, flush=True)
-        print("=" * 80, file=sys.stderr, flush=True)
         self.logger().info("Checking network connectivity...")
         try:
             # Add timeout to prevent hanging
             result = await asyncio.wait_for(super().check_network(), timeout=10.0)
-            print(f"[COFINEX] check_network() returned: {result}", file=sys.stderr, flush=True)
             self.logger().info(f"Network check result: {result}")
             return result
         except asyncio.TimeoutError:
-            print("[COFINEX] check_network() TIMEOUT after 10s", file=sys.stderr, flush=True)
             self.logger().error("Network check timed out after 10 seconds")
             return NetworkStatus.NOT_CONNECTED
         except Exception as e:
-            print(f"[COFINEX] check_network() exception: {e}", file=sys.stderr, flush=True)
             self.logger().error(f"Network check failed: {e}", exc_info=True)
             return NetworkStatus.NOT_CONNECTED
 
@@ -860,7 +1250,7 @@ class CofinexExchange(ExchangePyBase):
         # For paper trading, credentials are not required
         # Check if this is paper trade mode by checking if trading_required is False
         # or if credentials are empty (paper trade allows empty credentials)
-        if not self.trading_required:
+        if not self.is_trading_required:
             # Paper trading mode - skip authentication
             self.logger().info("Paper trading mode: Skipping OAuth authentication")
             return
@@ -872,16 +1262,21 @@ class CofinexExchange(ExchangePyBase):
             )
 
         # Create auth instance
+        # Note: OAuth token URL is always production (same for local and production testing)
         # Note: api_factory will be set after web_assistants_factory is created
         self._auth = CofinexAuth(
             username=username,
-            password=password
+            password=password,
+            # oauth_token_url defaults to CONSTANTS.OAUTH_TOKEN_URL (production)
         )
 
-        # Set API factory for token requests (will be set after factory creation)
-        # This is a temporary workaround - proper implementation needs ExchangePyBase refactor
-        # if hasattr(self, '_web_assistants_factory'):
-        #     self._auth.set_api_factory(self._web_assistants_factory)
+        # Set API factory for token requests (optional - auth creates its own for token requests)
+        # The _web_assistants_factory is created in __init__() before start_network()
+        if hasattr(self, '_web_assistants_factory') and self._web_assistants_factory is not None:
+            # Set the API factory so auth can use it for throttling/configuration consistency
+            # Note: The auth will create its own factory for token requests to avoid circular dependency
+            self._auth.set_api_factory(self._web_assistants_factory)
+            self.logger().info("API factory set on auth instance for token requests")
 
         self.logger().info("Cofinex OAuth authentication initialized")
 
@@ -893,7 +1288,7 @@ class CofinexExchange(ExchangePyBase):
     # The order book tracker is created in ExchangePyBase.__init__() and started in super().start_network()
     # This method is kept for reference but not used
 
-    async def get_order_book(self, trading_pair: str) -> Optional[OrderBook]:
+    def get_order_book(self, trading_pair: str) -> OrderBook:
         """
         Get order book for a trading pair
 
@@ -901,9 +1296,14 @@ class CofinexExchange(ExchangePyBase):
             trading_pair: Trading pair symbol
 
         Returns:
-            OrderBook instance or None if not available
+            OrderBook instance
+
+        Raises:
+            ValueError: If order book doesn't exist for the trading pair
         """
-        return self._order_books.get(trading_pair)
+        if trading_pair not in self.order_book_tracker.order_books:
+            raise ValueError(f"No order book exists for '{trading_pair}'.")
+        return self.order_book_tracker.order_books[trading_pair]
 
     # =============================================================================
     # USER STREAM MANAGEMENT
@@ -990,15 +1390,6 @@ class CofinexExchange(ExchangePyBase):
         """
         Override _create_order to handle missing trading rules for paper trading.
         """
-        debug_file = "/tmp/cofinex_place_order.txt"
-
-        # CRITICAL: Write to debug file immediately with flush AND stderr
-        fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-        os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] COFINEX _create_order OVERRIDE CALLED: order_id={order_id}, trading_pair={trading_pair}\n".encode())
-        os.fsync(fd)
-        os.close(fd)
-        print(f"[COFINEX] _create_order OVERRIDE called: order_id={order_id}, trading_pair={trading_pair}", file=sys.stderr, flush=True)
-
         try:
             self.logger().info(f"[COFINEX OVERRIDE] _create_order called for {trading_pair}, order_id={order_id}")
 
@@ -1024,12 +1415,6 @@ class CofinexExchange(ExchangePyBase):
                     )
                     self._trading_rules[trading_pair] = default_rule
                     self.logger().info(f"Created default trading rule for {trading_pair}")
-                    print(f"[COFINEX] Created default trading rule for {trading_pair}", file=sys.stderr, flush=True)
-
-            fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-            os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] About to call super()._create_order(), trading_rules={list(self._trading_rules.keys())}\n".encode())
-            os.fsync(fd)
-            os.close(fd)
 
             # Call parent _create_order which will validate and place the order
             await super()._create_order(
@@ -1042,20 +1427,7 @@ class CofinexExchange(ExchangePyBase):
                 **kwargs
             )
 
-            fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-            os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _create_order completed successfully\n".encode())
-            os.fsync(fd)
-            os.close(fd)
-            print("[COFINEX] _create_order completed successfully", file=sys.stderr, flush=True)
-
         except Exception as e:
-            fd = os.open(debug_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-            import traceback
-            os.write(fd, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _create_order EXCEPTION: {e}\n".encode())
-            os.write(fd, traceback.format_exc().encode())
-            os.fsync(fd)
-            os.close(fd)
-            print(f"[COFINEX] _create_order EXCEPTION: {e}", file=sys.stderr, flush=True)
             self.logger().error(f"Exception in _create_order: {e}", exc_info=True)
             raise
 
@@ -1090,13 +1462,7 @@ class CofinexExchange(ExchangePyBase):
         Returns:
             Tuple of (exchange_order_id, timestamp)
         """
-        debug_file = "/tmp/cofinex_place_order.txt"
         try:
-            with open(debug_file, "a") as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order called: order_id={order_id}, trading_pair={trading_pair}, amount={amount}, trade_type={trade_type}, order_type={order_type}, price={price}\n")
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order: is_trading_required={self.is_trading_required}, _trading_required={getattr(self, '_trading_required', 'NOT SET')}\n")
-                f.flush()
-            print(f"[COFINEX] _place_order called: order_id={order_id}", file=sys.stderr, flush=True)
             self.logger().info(f"Placing {trade_type.name} {order_type.name} order: {order_id} for {amount} {trading_pair} at {price}")
 
             # For paper trading, we don't need authentication
@@ -1112,52 +1478,80 @@ class CofinexExchange(ExchangePyBase):
                 exchange_order_id = f"PAPER_{order_id}"
                 # Use time.time() instead of current_timestamp in case it's not initialized yet
                 timestamp = float(time.time())
-                with open(debug_file, "a") as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order (paper): returning exchange_order_id={exchange_order_id}, timestamp={timestamp}\n")
-                    f.flush()
-                print(f"[COFINEX] _place_order (paper): returning exchange_order_id={exchange_order_id}, timestamp={timestamp}", file=sys.stderr, flush=True)
                 self.logger().info(f"Paper trading order {order_id} placed with exchange_order_id {exchange_order_id}")
                 return exchange_order_id, timestamp
         except Exception as e:
-            with open(debug_file, "a") as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] _place_order EXCEPTION: {e}\n")
-                import traceback
-                f.write(traceback.format_exc())
-                f.flush()
-            print(f"[COFINEX] _place_order EXCEPTION: {e}", file=sys.stderr, flush=True)
             self.logger().error(f"Exception in _place_order: {e}", exc_info=True)
             raise
 
-        # TODO: Implement actual API call for live trading
-        # This is the live trading implementation:
-        #
-        # # Convert trading pair to exchange symbol format
-        # exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        #
-        # # Build order data
-        # order_data = {
-        #     "symbol": exchange_symbol,
-        #     "side": "BUY" if trade_type == TradeType.BUY else "SELL",
-        #     "type": "LIMIT" if order_type == OrderType.LIMIT else "MARKET",
-        #     "quantity": str(amount),
-        #     "price": str(price) if price else None,
-        #     "timeInForce": "GTC"
-        # }
-        #
-        # # Make API request
-        # response = await self._api_post(
-        #     path_url=CONSTANTS.ORDER_PATH_URL,
-        #     data=order_data,
-        #     is_auth_required=True,
-        #     limit_id=CONSTANTS.ORDER_PATH_URL,
-        # )
-        #
-        # exchange_order_id = str(response["orderId"])
-        # timestamp = self.current_timestamp
-        # return exchange_order_id, timestamp
+        # Implement actual API call for live trading
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
 
-        # For now, if live trading is required but not implemented, raise an error
-        raise NotImplementedError("Live trading order placement not yet implemented")
+        # Convert trading pair to exchange symbol format (CNX-USDT -> CNX/USDT)
+        exchange_symbol = self._convert_to_exchange_symbol(trading_pair)
+
+        # Build order data according to API specification
+        order_data = {
+            "symbol": exchange_symbol,
+            "side": "BUY" if trade_type == TradeType.BUY else "SELL",
+            "order_type": "LIMIT" if order_type == OrderType.LIMIT else "MARKET",
+            "quantity": float(amount),  # API expects number, not string
+            "price": float(price) if price else None,  # API expects number, not string
+            "time_in_force": "GTC"
+        }
+
+        # Remove None values
+        order_data = {k: v for k, v in order_data.items() if v is not None}
+
+        # Make API request
+        rest_api_base_url = getattr(self, "_rest_api_base_url", None)
+        url = web_utils.private_rest_url(
+            path_url=CONSTANTS.ORDERS_PATH_URL,
+            domain=self._domain,
+            rest_api_base_url=rest_api_base_url,
+        )
+
+        response = await rest_assistant.execute_request(
+            url=url,
+            method=RESTMethod.POST,
+            data=order_data,
+            is_auth_required=True,
+            throttler_limit_id=CONSTANTS.POST_ORDER_LIMIT_ID,
+        )
+
+        # Parse response:
+        # {
+        #     "order_id": "1768048527086",
+        #     "status": "SUCCESS",
+        #     "message": "Order placed successfully",
+        #     "timestamp": "2026-01-10T18:05:32.295813"
+        # }
+
+        if not isinstance(response, dict):
+            raise ValueError(f"Invalid response format: {type(response)}")
+
+        if response.get("status") != "SUCCESS":
+            error_msg = response.get("message", "Unknown error")
+            raise Exception(f"Order placement failed: {error_msg}")
+
+        exchange_order_id = str(response.get("order_id"))
+        if not exchange_order_id:
+            raise ValueError("No order_id in response")
+
+        # Parse timestamp from ISO format
+        timestamp_str = response.get("timestamp", "")
+        if timestamp_str:
+            from datetime import datetime
+            try:
+                dt = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                timestamp = dt.timestamp()
+            except (ValueError, AttributeError):
+                timestamp = self.current_timestamp
+        else:
+            timestamp = self.current_timestamp
+
+        self.logger().info(f"Order placed successfully: exchange_order_id={exchange_order_id}, timestamp={timestamp}")
+        return exchange_order_id, timestamp
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
         """
@@ -1176,14 +1570,15 @@ class CofinexExchange(ExchangePyBase):
         Returns:
             True if cancellation was successful, False otherwise
         """
-        import sys
-        print(f"[COFINEX] _place_cancel called: order_id={order_id}, exchange_order_id={tracked_order.exchange_order_id}", file=sys.stderr, flush=True)
+        import time
+
+        from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+
         self.logger().info(f"Canceling order: {order_id} (exchange_order_id: {tracked_order.exchange_order_id})")
 
         # For paper trading, we don't need authentication
         if not self.is_trading_required:
             # Paper trading mode - return immediately
-            print("[COFINEX] _place_cancel (paper): returning True", file=sys.stderr, flush=True)
             self.logger().info(f"Paper trading order {order_id} canceled successfully")
             return True
 
@@ -1191,41 +1586,286 @@ class CofinexExchange(ExchangePyBase):
         if not self._auth:
             raise Exception("Not authenticated for live trading")
 
-        # TODO: Implement actual API call for live trading
-        # This is the live trading implementation:
-        #
-        # exchange_order_id = tracked_order.exchange_order_id
-        # if not exchange_order_id or exchange_order_id == "UNKNOWN":
-        #     self.logger().warning(f"Cannot cancel order {order_id} without exchange_order_id")
-        #     return False
-        #
-        # # Convert trading pair to exchange symbol format
-        # exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
-        #
-        # # Make API request to cancel order
-        # try:
-        #     response = await self._api_delete(
-        #         path_url=f"{CONSTANTS.ORDER_PATH_URL}/{exchange_order_id}",
-        #         params={"symbol": exchange_symbol},
-        #         is_auth_required=True,
-        #         limit_id=CONSTANTS.ORDER_PATH_URL,
-        #     )
-        #
-        #     if response.get("status") == "CANCELED":
-        #         return True
-        #     else:
-        #         self.logger().warning(f"Order cancellation returned unexpected status: {response.get('status')}")
-        #         return False
-        # except IOError as e:
-        #     # Check if order not found
-        #     if self._is_order_not_found_during_cancelation_error(e):
-        #         self.logger().info(f"Order {order_id} not found during cancellation (may already be canceled)")
-        #         await self._order_tracker.process_order_not_found(order_id)
-        #         return True
-        #     raise
+        # Implement actual API call for live trading
+        exchange_order_id = tracked_order.exchange_order_id
+        if not exchange_order_id or exchange_order_id == "UNKNOWN":
+            self.logger().warning(f"Cannot cancel order {order_id} without exchange_order_id")
+            return False
 
-        # For now, if live trading is required but not implemented, raise an error
-        raise NotImplementedError("Live trading order cancellation not yet implemented")
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+
+        # Make API request to cancel order: DELETE /orders/{orderId}
+        rest_api_base_url = getattr(self, "_rest_api_base_url", None)
+        url = web_utils.private_rest_url(
+            path_url=f"{CONSTANTS.ORDER_PATH_URL}/{exchange_order_id}",
+            domain=self._domain,
+            rest_api_base_url=rest_api_base_url,
+        )
+
+        try:
+            response = await rest_assistant.execute_request(
+                url=url,
+                method=RESTMethod.DELETE,
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.DELETE_ORDER_LIMIT_ID,
+            )
+
+            # Parse response:
+            # {
+            #     "order_id": "1768048599757",
+            #     "status": "SUCCESS",
+            #     "message": "Order cancelled successfully",
+            #     "timestamp": "2026-01-10T18:08:05.304423"
+            # }
+
+            if not isinstance(response, dict):
+                self.logger().error(f"Invalid cancel response format: {type(response)}")
+                return False
+
+            if response.get("status") == "SUCCESS":
+                # Even if cancellation reports success, verify actual order status
+                # There could be a race condition where order was filled during cancellation
+                self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) cancellation reported success. Verifying actual status...")
+
+                try:
+                    order_status_data = await self._request_order_status(tracked_order)
+                    if order_status_data:
+                        status_str = order_status_data.get("status", "")
+                        new_state = self._parse_order_status_to_state(status_str)
+
+                        if new_state == OrderState.FILLED:
+                            # Order was actually filled, not cancelled - update status
+                            # Create TradeUpdate to trigger OrderFilledEvent (for fill counters)
+                            trade_update = self._create_trade_update_from_order_status(tracked_order, order_status_data)
+
+                            # Set executed amounts FIRST
+                            executed_qty = Decimal(str(order_status_data.get("executedQuantity", "0")))
+                            price = Decimal(str(order_status_data.get("price", "0")))
+                            if executed_qty > 0 and price > 0:
+                                tracked_order.executed_amount_base = executed_qty
+                                tracked_order.executed_amount_quote = executed_qty * price
+                                tracked_order.check_filled_condition()
+
+                            # Process trade update FIRST (triggers OrderFilledEvent)
+                            if trade_update:
+                                self._order_tracker.process_trade_update(trade_update)
+                                self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) - processed trade fill event")
+
+                            # Process order update (triggers BuyOrderCompletedEvent/SellOrderCompletedEvent)
+                            order_update = OrderUpdate(
+                                trading_pair=tracked_order.trading_pair,
+                                update_timestamp=time.time(),
+                                new_state=OrderState.FILLED,
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                            )
+                            future = self._order_tracker.process_order_update(order_update)
+                            if future:
+                                await future
+
+                            self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) was FILLED (not cancelled). Updated order status.")
+                            # Return False to prevent base class from emitting OrderCancelledEvent
+                            # The order is FILLED, not cancelled, so we don't want a cancellation event
+                            return False
+                        elif new_state == OrderState.CANCELED:
+                            # Order was actually cancelled - this is expected
+                            self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) confirmed as cancelled.")
+                            return True
+                        else:
+                            # Order status is something else - log and treat as cancelled
+                            self.logger().warning(f"Order {order_id} (exchange_order_id: {exchange_order_id}) has unexpected status after cancellation: {status_str}. Treating as cancelled.")
+                            return True
+                    else:
+                        # Could not get order status - assume cancellation succeeded
+                        self.logger().warning(f"Could not verify order status for {order_id} (exchange_order_id: {exchange_order_id}) after cancellation. Assuming cancelled.")
+                        return True
+                except Exception as status_error:
+                    # Error querying order status - assume cancellation succeeded
+                    self.logger().warning(f"Error verifying order status for {order_id} (exchange_order_id: {exchange_order_id}) after cancellation: {status_error}. Assuming cancelled.")
+                    return True
+            else:
+                error_msg = response.get("message", "Unknown error")
+                self.logger().warning(f"Order cancellation returned unexpected status: {response.get('status')}, message: {error_msg}")
+                return False
+
+        except IOError as e:
+            # Check if order not found (404 error)
+            if self._is_order_not_found_during_cancelation_error(e):
+                self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) not found during cancellation. Querying order status...")
+
+                # Query order status to determine if it was filled or canceled
+                try:
+                    order_status_data = await self._request_order_status(tracked_order)
+                    if order_status_data:
+                        # Get status string and convert to OrderState enum
+                        status_str = order_status_data.get("status", "")
+                        new_state = self._parse_order_status_to_state(status_str)
+
+                        import time
+
+                        from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+
+                        if new_state == OrderState.FILLED:
+                            # Order was filled - create TradeUpdate to trigger OrderFilledEvent
+                            trade_update = self._create_trade_update_from_order_status(tracked_order, order_status_data)
+
+                            # Update executed amounts
+                            executed_qty = Decimal(str(order_status_data.get("executedQuantity", "0")))
+                            price = Decimal(str(order_status_data.get("price", "0")))
+                            if executed_qty > 0 and price > 0:
+                                tracked_order.executed_amount_base = executed_qty
+                                tracked_order.executed_amount_quote = executed_qty * price
+                                tracked_order.check_filled_condition()
+
+                            # Process trade update FIRST (triggers OrderFilledEvent)
+                            if trade_update:
+                                self._order_tracker.process_trade_update(trade_update)
+                                self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) - processed trade fill event")
+
+                            # Process order update (triggers BuyOrderCompletedEvent/SellOrderCompletedEvent)
+                            order_update = OrderUpdate(
+                                trading_pair=tracked_order.trading_pair,
+                                update_timestamp=time.time(),
+                                new_state=OrderState.FILLED,
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                            )
+                            future = self._order_tracker.process_order_update(order_update)
+                            if future:
+                                await future
+
+                            self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) was FILLED. Updated order status.")
+                            # Return False to prevent base class from emitting OrderCancelledEvent
+                            # The order is FILLED, not cancelled, so we don't want a cancellation event
+                            return False
+                        elif new_state == OrderState.CANCELED:
+                            # Order was already canceled
+                            order_update = OrderUpdate(
+                                trading_pair=tracked_order.trading_pair,
+                                update_timestamp=time.time(),
+                                new_state=OrderState.CANCELED,
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                            )
+                            future = self._order_tracker.process_order_update(order_update)
+                            if future:
+                                await future
+                            self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) was already CANCELED.")
+                            return True
+                        else:
+                            # Order status is something else (OPEN, etc.)
+                            order_update = OrderUpdate(
+                                trading_pair=tracked_order.trading_pair,
+                                update_timestamp=time.time(),
+                                new_state=new_state,
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                            )
+                            future = self._order_tracker.process_order_update(order_update)
+                            if future:
+                                await future
+                            self.logger().info(f"Order {order_id} (exchange_order_id: {exchange_order_id}) has status: {status_str} (state: {new_state.name}). Updated order status.")
+                            return True
+                    else:
+                        # Could not get order status - treat as not found
+                        self.logger().warning(f"Could not retrieve order status for {order_id} (exchange_order_id: {exchange_order_id}). Treating as not found.")
+                        await self._order_tracker.process_order_not_found(order_id)
+                        return True
+                except Exception as status_error:
+                    # Error querying order status - treat as not found
+                    self.logger().warning(f"Error querying order status for {order_id} (exchange_order_id: {exchange_order_id}): {status_error}. Treating as not found.")
+                    await self._order_tracker.process_order_not_found(order_id)
+                    return True
+            raise
+        except Exception as e:
+            self.logger().error(f"Error cancelling order {order_id}: {e}", exc_info=True)
+            raise
+
+    async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
+        """
+        Cancels all currently active orders. The cancellations are performed sequentially
+        (one after another) to avoid overwhelming the API during shutdown.
+
+        :param timeout_seconds: the maximum time (in seconds) the cancel logic should run
+        :return: a list of CancellationResult instances, one for each of the orders to be cancelled
+        """
+        from async_timeout import timeout
+
+        incomplete_orders = [o for o in self.in_flight_orders.values() if not o.is_done]
+        order_id_set = set([o.client_order_id for o in incomplete_orders])
+        successful_cancellations = []
+
+        if not incomplete_orders:
+            self.logger().info("No orders to cancel")
+            return []
+
+        # Calculate dynamic timeout: at least 1 second per order, minimum 20 seconds
+        # This ensures we have enough time for sequential cancellation
+        calculated_timeout = max(timeout_seconds, len(incomplete_orders) * 1.0, 20.0)
+        self.logger().info(
+            f"Cancelling {len(incomplete_orders)} orders with timeout {calculated_timeout}s. "
+            f"Orders: {[f'{o.client_order_id[:20]}...({o.exchange_order_id})' for o in incomplete_orders[:10]]}"
+            + (f" ... and {len(incomplete_orders) - 10} more" if len(incomplete_orders) > 10 else "")
+        )
+
+        try:
+            async with timeout(calculated_timeout):
+                # Cancel orders sequentially (one after another) with rate limit delay
+                # API limit is 10 DELETE requests per second, so add 100ms delay between cancellations
+                for i, order in enumerate(incomplete_orders):
+                    try:
+                        client_order_id = await self._execute_cancel(order.trading_pair, order.client_order_id)
+                        if client_order_id is not None:
+                            order_id_set.discard(client_order_id)
+                            successful_cancellations.append(CancellationResult(client_order_id, True))
+
+                        # Add delay between cancellations to respect rate limit (10 req/sec = 100ms delay)
+                        # Skip delay for last order
+                        if i < len(incomplete_orders) - 1:
+                            await asyncio.sleep(0.1)
+                    except Exception as e:
+                        # Log error but continue with next order
+                        self.logger().warning(f"Error cancelling order {order.client_order_id}: {e}")
+                        # Still add delay even on error to respect rate limit
+                        if i < len(incomplete_orders) - 1:
+                            await asyncio.sleep(0.1)
+        except asyncio.TimeoutError:
+            self.logger().warning(
+                f"Timeout while cancelling orders after {calculated_timeout}s. "
+                f"Remaining orders: {len(order_id_set)}"
+            )
+            # Continue canceling remaining orders even after timeout (with individual timeouts)
+            remaining_orders = [o for o in incomplete_orders if o.client_order_id in order_id_set]
+            self.logger().info(f"Attempting to cancel {len(remaining_orders)} remaining orders...")
+            for i, order in enumerate(remaining_orders):
+                try:
+                    # Use individual timeout of 2 seconds per order
+                    async with timeout(2.0):
+                        client_order_id = await self._execute_cancel(order.trading_pair, order.client_order_id)
+                        if client_order_id is not None:
+                            order_id_set.discard(client_order_id)
+                            successful_cancellations.append(CancellationResult(client_order_id, True))
+
+                        # Add delay between cancellations to respect rate limit
+                        if i < len(remaining_orders) - 1:
+                            await asyncio.sleep(0.1)
+                except (asyncio.TimeoutError, Exception) as exc:
+                    self.logger().warning(f"Failed to cancel remaining order {order.client_order_id}: {exc}")
+                    # Still add delay even on error to respect rate limit
+                    if i < len(remaining_orders) - 1:
+                        await asyncio.sleep(0.1)
+        except Exception:
+            self.logger().network(
+                "Unexpected error cancelling orders.",
+                exc_info=True,
+                app_warning_msg="Failed to cancel orders. Check API key and network connection."
+            )
+        failed_cancellations = [CancellationResult(oid, False) for oid in order_id_set]
+
+        if failed_cancellations:
+            self.logger().warning(f"Failed to cancel {len(failed_cancellations)} orders: {[r.order_id for r in failed_cancellations]}")
+
+        return successful_cancellations + failed_cancellations
 
     async def cancel_order(self, trading_pair: str, order_id: str) -> bool:
         """
@@ -1268,38 +1908,97 @@ class CofinexExchange(ExchangePyBase):
 
     async def get_open_orders(self, trading_pair: str = None) -> List[LimitOrder]:
         """
-        Get open orders
+        Get open orders from exchange.
 
-        TODO: Implement open orders retrieval:
-        1. Make API call to get open orders
-        2. Parse response and create LimitOrder objects
-        3. Update local tracking
-        4. Filter by trading pair if specified
+        Endpoint: GET /orders
+
+        Response format:
+        {
+            "user_id": 1120,
+            "orders": [
+                {
+                    "order_id": 1768056258031,
+                    "symbol_id": 12,
+                    "symbol": "CNX/USDT",
+                    "side": "SELL",
+                    "order_type": "GTC",
+                    "price": "0.1",
+                    "size": "10",
+                    "filled": "0",
+                    "reserve_bid_price": 0.1,
+                    "timestamp": 1768036462000,
+                    "status": "OPEN"
+                }
+            ],
+            "timestamp": "2026-01-10T20:14:36.748759"
+        }
 
         Args:
-            trading_pair: Optional trading pair filter
+            trading_pair: Optional trading pair filter (Hummingbot format: "CNX-USDT")
 
         Returns:
-            List of open orders
+            List of LimitOrder objects
         """
-        # TODO: Implement actual API call to get open orders
-        # Example implementation:
-        # try:
-        #     params = {"symbol": trading_pair} if trading_pair else {}
-        #     response = await self._api_request("GET", "/openOrders", params=params)
-        #     orders = []
-        #     for order_data in response:
-        #         order = self._parse_order_data(order_data)
-        #         orders.append(order)
-        #     return orders
-        # except Exception as e:
-        #     self.logger().error(f"Failed to get open orders: {e}")
-        #     return []
+        try:
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
 
-        # For now, return locally tracked orders
+            # Make API request: GET /orders
+            rest_api_base_url = getattr(self, "_rest_api_base_url", None)
+            url = web_utils.private_rest_url(
+                path_url=CONSTANTS.OPEN_ORDERS_PATH_URL,
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
+
+            # Optional: Add symbol filter if specified
+            params = {}
+            if trading_pair:
+                # Convert Hummingbot format to exchange format
+                exchange_symbol = self._convert_to_exchange_symbol(trading_pair)
+                params["symbol"] = exchange_symbol
+
+            response = await rest_assistant.execute_request(
+                url=url,
+                method=RESTMethod.GET,
+                params=params if params else None,
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.OPEN_ORDERS_PATH_URL,
+            )
+
+            # Parse response
+            if not isinstance(response, dict):
+                self.logger().error(f"Invalid open orders response format: {type(response)}")
+                return []
+
+            orders_list = response.get("orders", [])
+            if not isinstance(orders_list, list):
+                self.logger().warning("No orders array in response")
+                return []
+
+            # Convert to LimitOrder objects
+            limit_orders = []
+            for order_data in orders_list:
+                try:
+                    # Convert exchange order data to LimitOrder
+                    order = self._parse_order_data_to_limit_order(order_data)
+                    if order:
+                        # Filter by trading pair if specified
+                        if trading_pair and order.trading_pair != trading_pair:
+                            continue
+                        limit_orders.append(order)
+                except Exception as e:
+                    self.logger().warning(f"Error parsing order data: {order_data}, error: {e}")
+                    continue
+
+            self.logger().info(f"Retrieved {len(limit_orders)} open orders from exchange")
+            return limit_orders
+
+        except Exception as e:
+            self.logger().error(f"Failed to get open orders: {e}", exc_info=True)
+            # Fallback to locally tracked orders if API call fails
         if trading_pair:
             return [order for order in self._in_flight_orders.values()
-                    if order.trading_pair == trading_pair]
+                    if order.trading_pair == trading_pair]  # noqa: E128
         return list(self._in_flight_orders.values())
 
     # =============================================================================
@@ -1406,36 +2105,36 @@ class CofinexExchange(ExchangePyBase):
     # =============================================================================
     # API REQUEST HELPERS
     # =============================================================================
+    # Note: _api_request is inherited from ExchangePyBase and uses the correct signature
+    # It calls _api_request_url() which uses web_utils.public_rest_url() or private_rest_url()
 
-    async def _api_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+    async def _api_request_url(self, path_url: str, is_auth_required: bool = False) -> str:
         """
-        Make authenticated API request
+        Build the full URL for an API request.
 
-        TODO: Implement API request method:
-        1. Add authentication headers
-        2. Implement rate limiting
-        3. Handle retries and errors
-        4. Parse response
-        5. Update rate limit counters
+        This method is called by the base class _api_request() to construct URLs.
+        It uses web_utils to handle domain-specific URL construction and local testing overrides.
 
         Args:
-            method: HTTP method (GET, POST, etc.)
-            endpoint: API endpoint
-            **kwargs: Additional request parameters
+            path_url: API endpoint path (e.g., "/api/v1/time")
+            is_auth_required: Whether the endpoint requires authentication
 
         Returns:
-            API response as dictionary
+            Full URL string
         """
-        # TODO: Implement actual API request method
-        # This should:
-        # 1. Add authentication headers using self._auth
-        # 2. Implement rate limiting
-        # 3. Handle retries with exponential backoff
-        # 4. Parse JSON response
-        # 5. Handle errors appropriately
-
-        # For now, return empty response
-        return {}
+        rest_api_base_url = getattr(self, "_rest_api_base_url", None)
+        if is_auth_required:
+            return web_utils.private_rest_url(
+                path_url=path_url,
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
+        else:
+            return web_utils.public_rest_url(
+                path_url=path_url,
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
 
     # =============================================================================
     # TRADING PAIR SYMBOL MAPPING
@@ -1451,8 +2150,6 @@ class CofinexExchange(ExchangePyBase):
         Optimized to only fetch the pairs we actually need instead of all 725 pairs.
         """
         try:
-            import sys
-            print(f"[COFINEX] _initialize_trading_pair_symbol_map called. self._trading_pairs = {getattr(self, '_trading_pairs', 'NOT SET')}", file=sys.stderr, flush=True)
             self.logger().info(f"_initialize_trading_pair_symbol_map called. Trading pairs: {getattr(self, '_trading_pairs', 'NOT SET')}")
 
             # Check if we have configured trading pairs
@@ -1462,21 +2159,18 @@ class CofinexExchange(ExchangePyBase):
                 # No configured pairs - this is likely autocompletion or early initialization
                 # Don't fetch anything - the symbol map will be built when pairs are configured
                 # Don't set an empty map - leave it as None so it will be retried when pairs are available
-                print("[COFINEX] No trading pairs configured - skipping initialization (will retry when pairs are set)", file=sys.stderr, flush=True)
                 self.logger().debug("No configured trading pairs yet - skipping initialization (will retry when pairs are set)")
                 # Don't set the map - leave it as None so trading_pair_symbol_map_ready() returns False
                 # This allows it to be called again later when trading pairs are available
                 return
 
             # IMPORTANT: We have trading pairs now - use per-pair endpoint
-            print(f"[COFINEX] _initialize_trading_pair_symbol_map: Using per-pair endpoint for {len(self._trading_pairs)} pairs: {self._trading_pairs}", file=sys.stderr, flush=True)
             self.logger().info(f"Using per-pair endpoint for {len(self._trading_pairs)} configured pairs: {self._trading_pairs}")
 
             # We have configured pairs - use the optimized per-pair endpoint
             trading_pairs_data = await self._fetch_trading_pairs_for_configured_pairs()
 
             if not trading_pairs_data:
-                print("[COFINEX] No trading pairs data fetched - setting empty symbol map", file=sys.stderr, flush=True)
                 self.logger().warning("No trading pairs data fetched - setting empty symbol map")
                 self._set_trading_pair_symbol_map(bidict())
                 return
@@ -1739,8 +2433,6 @@ class CofinexExchange(ExchangePyBase):
         Override to add timeout and logging to prevent hangs
         """
         import asyncio
-        import sys
-        print("[COFINEX] _make_network_check_request() called", file=sys.stderr, flush=True)
         self.logger().info("Making network check request...")
         try:
             # Add timeout to prevent hanging
@@ -1748,26 +2440,113 @@ class CofinexExchange(ExchangePyBase):
                 super()._make_network_check_request(),
                 timeout=5.0
             )
-            print("[COFINEX] _make_network_check_request() completed", file=sys.stderr, flush=True)
             return result
         except asyncio.TimeoutError:
-            print("[COFINEX] _make_network_check_request() TIMEOUT after 5s", file=sys.stderr, flush=True)
             self.logger().error("Network check request timed out after 5 seconds")
             raise
         except Exception as e:
-            print(f"[COFINEX] _make_network_check_request() exception: {e}", file=sys.stderr, flush=True)
             self.logger().error(f"Network check request failed: {e}", exc_info=True)
             raise
 
+    def _parse_order_data_to_limit_order(self, order_data: Dict[str, Any]) -> Optional[LimitOrder]:
+        """
+        Parse order data from exchange API response to LimitOrder.
+
+        Handles the actual exchange format:
+        {
+            "order_id": 1768056258031,
+            "symbol": "CNX/USDT",
+            "side": "SELL",
+            "order_type": "GTC",
+            "price": "0.1",
+            "size": "10",
+            "filled": "0",
+            "status": "OPEN"
+        }
+
+        Args:
+            order_data: Raw order data from exchange API
+
+        Returns:
+            LimitOrder object or None if parsing fails
+        """
+        try:
+            # Extract fields from exchange format
+            order_id = str(order_data.get("order_id", ""))
+            if not order_id:
+                self.logger().warning(f"Order data missing order_id: {order_data}")
+                return None
+
+            symbol = order_data.get("symbol", "")
+            if not symbol:
+                self.logger().warning(f"Order data missing symbol: {order_data}")
+                return None
+
+            # Convert exchange symbol format (CNX/USDT) to Hummingbot format (CNX-USDT)
+            trading_pair = symbol.replace("/", "-")
+
+            # Extract side
+            side = order_data.get("side", "").upper()
+            is_buy = side == "BUY"
+
+            # Extract price and quantity
+            price_str = order_data.get("price", "0")
+            size_str = order_data.get("size", "0")
+            filled_str = order_data.get("filled", "0")
+
+            try:
+                price = Decimal(str(price_str))
+                quantity = Decimal(str(size_str))
+                filled_quantity = Decimal(str(filled_str))
+            except (ValueError, TypeError) as e:
+                self.logger().warning(f"Error parsing order amounts: {e}, order_data: {order_data}")
+                return None
+
+            # Parse status (exchange uses "OPEN", Hummingbot uses "NEW")
+            status_str = order_data.get("status", "OPEN").upper()
+            status = self._parse_order_status(status_str)
+
+            # Extract order type (exchange uses "GTC" but means LIMIT with GTC)
+            order_type_str = order_data.get("order_type", "GTC").upper()
+            if order_type_str in ["GTC", "LIMIT"]:
+                order_type = OrderType.LIMIT
+            elif order_type_str == "MARKET":
+                order_type = OrderType.MARKET
+            else:
+                order_type = OrderType.LIMIT  # Default to LIMIT
+
+            # Extract base and quote currencies from trading pair
+            parts = trading_pair.split("-")
+            base_currency = parts[0] if len(parts) >= 1 else ""
+            quote_currency = parts[1] if len(parts) >= 2 else ""
+
+            # Create LimitOrder
+            limit_order = LimitOrder(
+                client_order_id=order_id,  # Use exchange order_id as client_order_id (will be mapped later)
+                trading_pair=trading_pair,
+                is_buy=is_buy,
+                base_currency=base_currency,
+                quote_currency=quote_currency,
+                price=price,
+                quantity=quantity,
+                filled_quantity=filled_quantity,
+                status=status,
+                order_type=order_type,
+                time_in_force="GTC"
+            )
+
+            return limit_order
+
+        except Exception as e:
+            self.logger().error(f"Error parsing order data: {e}, order_data: {order_data}", exc_info=True)
+            return None
+
     def _parse_order_data(self, order_data: Dict[str, Any]) -> LimitOrder:
         """
-        Parse order data from API response
+        Parse order data from API response (legacy method for compatibility).
 
-        TODO: Implement order data parsing:
-        1. Map API fields to LimitOrder fields
-        2. Handle different order types
-        3. Convert data types appropriately
-        4. Handle missing or null fields
+        This method expects a different format (standardized format).
+        For actual exchange responses, use _parse_order_data_to_limit_order instead.
 
         Args:
             order_data: Raw order data from API
@@ -1775,19 +2554,22 @@ class CofinexExchange(ExchangePyBase):
         Returns:
             LimitOrder object
         """
-        # TODO: Implement actual order data parsing
-        # This should map Cofinex order data to Hummingbot's LimitOrder format
+        # Try to parse using the new method first (handles exchange format)
+        limit_order = self._parse_order_data_to_limit_order(order_data)
+        if limit_order:
+            return limit_order
 
+        # Fallback to old format parsing (for compatibility)
         return LimitOrder(
-            client_order_id=order_data.get("orderId", ""),
-            trading_pair=order_data.get("symbol", ""),
-            is_buy=order_data.get("side") == "BUY",
+            client_order_id=order_data.get("orderId", order_data.get("order_id", "")),
+            trading_pair=order_data.get("symbol", "").replace("/", "-"),
+            is_buy=order_data.get("side", "").upper() == "BUY",
             base_currency="",
             quote_currency="",
             price=Decimal(str(order_data.get("price", "0"))),
-            quantity=Decimal(str(order_data.get("origQty", "0"))),
-            filled_quantity=Decimal(str(order_data.get("executedQty", "0"))),
-            status=order_data.get("status", "NEW"),
+            quantity=Decimal(str(order_data.get("origQty", order_data.get("size", "0")))),
+            filled_quantity=Decimal(str(order_data.get("executedQty", order_data.get("filled", "0")))),
+            status=self._parse_order_status(order_data.get("status", "NEW")),
             order_type=OrderType.LIMIT,
             time_in_force="GTC"
         )

@@ -1519,6 +1519,11 @@ class CofinexExchange(ExchangePyBase):
             throttler_limit_id=CONSTANTS.POST_ORDER_LIMIT_ID,
         )
 
+        # Log raw response from Exchange-Core for debugging
+        self.logger().info(
+            f"[PLACE_ORDER] Exchange-Core response for order {order_id}: {response}"
+        )
+
         # Parse response:
         # {
         #     "order_id": "1768048527086",
@@ -1526,13 +1531,42 @@ class CofinexExchange(ExchangePyBase):
         #     "message": "Order placed successfully",
         #     "timestamp": "2026-01-10T18:05:32.295813"
         # }
+        # OR for ERROR:
+        # {
+        #     "order_id": "1768048527086",
+        #     "status": "ERROR",
+        #     "error": "RISK_NSF",
+        #     "message": "Failed to place order: RISK_NSF"
+        # }
 
         if not isinstance(response, dict):
+            self.logger().error(
+                f"[PLACE_ORDER] Invalid response format for order {order_id}: "
+                f"expected dict, got {type(response)}. Response: {response}"
+            )
             raise ValueError(f"Invalid response format: {type(response)}")
 
-        if response.get("status") != "SUCCESS":
-            error_msg = response.get("message", "Unknown error")
-            raise Exception(f"Order placement failed: {error_msg}")
+        # Check response status - ERROR means order was rejected, don't track it
+        response_status = response.get("status", "").upper()
+        if response_status != "SUCCESS":
+            error_msg = response.get("message", response.get("error", "Unknown error"))
+            error_order_id = response.get("order_id")
+
+            # Log full error response for debugging
+            self.logger().warning(
+                f"[PLACE_ORDER] Exchange-Core returned {response_status} for order {order_id}. "
+                f"Full response: {response}. "
+                f"Error message: {error_msg}"
+            )
+
+            # Log warning if order_id exists in error response (order was created but rejected)
+            if error_order_id:
+                self.logger().warning(
+                    f"[PLACE_ORDER] Order placement returned {response_status} with order_id {error_order_id}. "
+                    f"Error: {error_msg}. Order was created but rejected by Exchange-Core - NOT tracking as valid order."
+                )
+            # Always raise exception for ERROR status - order should not be tracked
+            raise Exception(f"Order placement failed ({response_status}): {error_msg}")
 
         exchange_order_id = str(response.get("order_id"))
         if not exchange_order_id:
@@ -1550,7 +1584,11 @@ class CofinexExchange(ExchangePyBase):
         else:
             timestamp = self.current_timestamp
 
-        self.logger().info(f"Order placed successfully: exchange_order_id={exchange_order_id}, timestamp={timestamp}")
+        self.logger().info(
+            f"[PLACE_ORDER] Order placed successfully: "
+            f"client_order_id={order_id}, exchange_order_id={exchange_order_id}, "
+            f"status=SUCCESS, timestamp={timestamp}"
+        )
         return exchange_order_id, timestamp
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:

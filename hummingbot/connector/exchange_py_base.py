@@ -487,8 +487,18 @@ class ExchangePyBase(ExchangeBase, ABC):
                 f"Order {order.client_order_id} received exchange_order_id {exchange_order_id}, "
                 f"but this ID is already assigned to order {existing_order.client_order_id}. "
                 f"This is likely an Exchange-Core bug where order IDs are reused. "
-                f"Both orders may be tracked incorrectly."
+                f"Marking current order as FAILED to prevent duplicate tracking."
             )
+            # Mark this order as FAILED instead of OPEN to prevent duplicate tracking
+            order_update: OrderUpdate = OrderUpdate(
+                client_order_id=order.client_order_id,
+                exchange_order_id=str(exchange_order_id),
+                trading_pair=order.trading_pair,
+                update_timestamp=update_timestamp,
+                new_state=OrderState.FAILED,
+            )
+            self._order_tracker.process_order_update(order_update)
+            return exchange_order_id
 
         order_update: OrderUpdate = OrderUpdate(
             client_order_id=order.client_order_id,

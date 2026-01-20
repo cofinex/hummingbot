@@ -16,17 +16,28 @@ class ExitCommand:
 
     async def exit_loop(self,  # type: HummingbotApplication
                         force: bool = False):
+        from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+
         if self.trading_core.strategy_task is not None and not self.trading_core.strategy_task.cancelled():
             self.trading_core.strategy_task.cancel()
         if force is False:
-            success = await self.trading_core.cancel_outstanding_orders()
-            if not success:
-                self.notify('Wind down process terminated: Failed to cancel all outstanding orders. '
-                            '\nYou may need to manually cancel remaining orders by logging into your chosen exchanges'
-                            '\n\nTo force exit the app, enter "exit -f"')
-                return
-            # Freeze screen 1 second for better UI
-            await asyncio.sleep(1)
+            # Check if strategy wants to skip cancellation
+            strategy_skip_cancellation = False
+            if self.trading_core.strategy and isinstance(self.trading_core.strategy, ScriptStrategyBase):
+                if hasattr(self.trading_core.strategy, 'should_cancel_orders_on_stop'):
+                    strategy_skip_cancellation = not self.trading_core.strategy.should_cancel_orders_on_stop
+
+            if not strategy_skip_cancellation:
+                success = await self.trading_core.cancel_outstanding_orders()
+                if not success:
+                    self.notify('Wind down process terminated: Failed to cancel all outstanding orders. '
+                                '\nYou may need to manually cancel remaining orders by logging into your chosen exchanges'
+                                '\n\nTo force exit the app, enter "exit -f"')
+                    return
+                # Freeze screen 1 second for better UI
+                await asyncio.sleep(1)
+            else:
+                self.logger().info("Skipping order cancellation - strategy configured to keep orders active")
 
         if self.trading_core.gateway_monitor is not None:
             self.trading_core.gateway_monitor.stop_monitor()

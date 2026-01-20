@@ -36,8 +36,16 @@ class StopCommand:
             await self.trading_core.stop_strategy()
 
         # Cancel outstanding orders
-        if not skip_order_cancellation:
+        # Check if strategy wants to skip cancellation (unless explicitly overridden)
+        strategy_skip_cancellation = False
+        if self.trading_core.strategy and isinstance(self.trading_core.strategy, ScriptStrategyBase):
+            if hasattr(self.trading_core.strategy, 'should_cancel_orders_on_stop'):
+                strategy_skip_cancellation = not self.trading_core.strategy.should_cancel_orders_on_stop
+
+        if not skip_order_cancellation and not strategy_skip_cancellation:
             await self.trading_core.cancel_outstanding_orders()
+        elif strategy_skip_cancellation:
+            self.logger().info("Skipping order cancellation - strategy configured to keep orders active")
 
         # Remove all connectors
         connector_names = list(self.trading_core.connectors.keys())

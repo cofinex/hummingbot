@@ -805,8 +805,16 @@ class TradingCore:
                 await self.stop_strategy()
 
             # Cancel outstanding orders
-            if not skip_order_cancellation:
+            # Check if strategy wants to skip cancellation (unless explicitly overridden)
+            strategy_skip_cancellation = False
+            if self.strategy and isinstance(self.strategy, ScriptStrategyBase):
+                if hasattr(self.strategy, 'should_cancel_orders_on_stop'):
+                    strategy_skip_cancellation = not self.strategy.should_cancel_orders_on_stop
+
+            if not skip_order_cancellation and not strategy_skip_cancellation:
                 await self.cancel_outstanding_orders()
+            elif strategy_skip_cancellation:
+                self.logger().info("Skipping order cancellation - strategy configured to keep orders active")
 
             # Stop all metrics collectors first
             for connector_name, collector in list(self._metrics_collectors.items()):

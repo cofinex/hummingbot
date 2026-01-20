@@ -126,6 +126,10 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
         True,
         description="Refresh orders after Levels 2+ fills (real market activity, default: True)"
     )
+    cancel_orders_on_stop: bool = Field(
+        False,
+        description="Cancel all active orders when bot stops (default: False to keep orders active)"
+    )
 
 
 class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
@@ -551,13 +555,13 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         if self.refresh_pending:
             if self.current_timestamp >= self.last_fill_timestamp + self.config.filled_order_delay:
                 self.logger().info("Refreshing orders (triggered by fill or Bitget shift change)...")
-                self._refresh_orders()
+                safe_ensure_future(self._refresh_orders())
                 self.refresh_pending = False
 
         # Check if it's time for periodic refresh (or initial placement if create_timestamp is 0)
         elif self.create_timestamp == 0 or self.create_timestamp <= self.current_timestamp:
             self.logger().info("Initial order placement or periodic refresh triggered")
-            self._refresh_orders()
+            safe_ensure_future(self._refresh_orders())
             # Note: create_timestamp is now set inside _refresh_orders() after successful placement
 
         # Check if orders were cancelled externally (paper trading timeout, etc.)
@@ -572,7 +576,7 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                     f"Detected missing orders: Expected ~{expected_order_count}, found {len(active_orders)}. "
                     f"Orders may have been cancelled externally. Placing new orders..."
                 )
-                self._refresh_orders()
+                safe_ensure_future(self._refresh_orders())
 
     async def _fetch_bitget_change24h(self):
         """
@@ -638,12 +642,13 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error fetching Bitget change24h: {e}")
 
-    def _refresh_orders(self):
+    async def _refresh_orders(self):
         """
-        Cancel existing orders and place new multi-level orders
+        Cancel existing orders and place new multi-level orders.
+        Waits for all cancellations to complete before placing new orders.
         """
-        # Cancel all existing orders
-        self._cancel_all_orders()
+        # Cancel all existing orders and wait for completion
+        await self._cancel_all_orders()
 
         # Create multi-level order proposal with price shift
         proposal: List[OrderCandidate] = self._create_multi_level_proposal()
@@ -670,7 +675,7 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         proposal_adjusted: List[OrderCandidate] = self._adjust_proposal_to_budget(proposal)
 
         # Place orders with 10ms delay between each to avoid Exchange-Core duplicate order ID issues
-        safe_ensure_future(self._place_orders(proposal_adjusted))
+        await self._place_orders(proposal_adjusted)
 
         # Log order placement summary
         buy_orders = [o for o in proposal_adjusted if o.order_side == TradeType.BUY]
@@ -1043,18 +1048,40 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error placing {order.order_side.name} order: {e}")
 
-    def _cancel_all_orders(self):
+    async def _cancel_all_orders(self):
         """
-        Cancel all active orders
+        Cancel all active orders and wait for completion.
+        Uses the connector's cancel_all() method which waits for all cancellations to complete.
         """
+        connector = self.connectors[self.config.exchange]
         active_orders = self.get_active_orders(connector_name=self.config.exchange)
+
         if active_orders:
-            self.logger().info(f"Cancelling {len(active_orders)} active orders")
-            for order in active_orders:
-                try:
-                    self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
-                except Exception as e:
-                    self.logger().error(f"Error cancelling order {order.client_order_id}: {e}")
+            self.logger().info(f"Cancelling {len(active_orders)} active orders and waiting for completion...")
+            try:
+                # Use connector's cancel_all() which waits for all cancellations to complete
+                # Timeout: at least 1 second per order, minimum 10 seconds, maximum 60 seconds
+                timeout = min(max(len(active_orders) * 1.0, 10.0), 60.0)
+                cancellation_results = await connector.cancel_all(timeout_seconds=timeout)
+
+                successful = [r for r in cancellation_results if r.success]
+                failed = [r for r in cancellation_results if not r.success]
+
+                if successful:
+                    self.logger().info(f"Successfully cancelled {len(successful)} orders")
+                if failed:
+                    self.logger().warning(f"Failed to cancel {len(failed)} orders: {[r.order_id for r in failed]}")
+            except Exception as e:
+                self.logger().error(f"Error during batch cancellation: {e}", exc_info=True)
+                # Fallback: try individual cancellations
+                self.logger().info("Falling back to individual cancellations...")
+                for order in active_orders:
+                    try:
+                        self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+                    except Exception as cancel_error:
+                        self.logger().error(f"Error cancelling order {order.client_order_id}: {cancel_error}")
+                # Give some time for individual cancellations to process
+                await asyncio.sleep(0.5)
 
     def _is_level1_fill(self, event: OrderFilledEvent) -> bool:
         """
@@ -1207,3 +1234,27 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
             lines.append(f"    Refreshing in: {time_until_refresh:.1f}s")
 
         return "\n".join(lines)
+
+    @property
+    def should_cancel_orders_on_stop(self) -> bool:
+        """
+        Property that indicates whether orders should be cancelled when the bot stops.
+        This is checked by the stop command to determine if orders should be cancelled.
+        """
+        return self.config.cancel_orders_on_stop
+
+    async def on_stop(self):
+        """
+        Called when the bot is stopping.
+        Logs whether orders will be kept or cancelled based on config.
+        """
+        if self.config.cancel_orders_on_stop:
+            self.logger().info("Strategy configured to cancel orders on stop - orders will be cancelled")
+        else:
+            active_orders = self.get_active_orders(connector_name=self.config.exchange)
+            if active_orders:
+                self.logger().info(
+                    f"Strategy configured to keep orders on stop - {len(active_orders)} orders will remain active on the exchange"
+                )
+            else:
+                self.logger().info("Strategy configured to keep orders on stop - no active orders to keep")

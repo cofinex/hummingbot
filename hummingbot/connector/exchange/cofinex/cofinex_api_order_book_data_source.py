@@ -51,6 +51,9 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
     Fetches order book snapshots via REST API.
     """
 
+    # Override snapshot refresh interval (keep default 1 hour for periodic refresh)
+    FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 60 * 60  # 1 hour (trade-triggered refresh handles active periods)
+
     _logger: Optional[HummingbotLogger] = None
 
     def __init__(
@@ -86,6 +89,13 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._ws_last_message_time: float = 0.0
         self._ws_first_message_logged: bool = False
         self._ws_subscribed: bool = False
+
+        # Option C: Trade-triggered orderbook refresh tracking
+        self._last_snapshot_trigger_time: Dict[str, float] = {}  # Track last trigger per pair
+        self._snapshot_refresh_debounce: float = 5.0  # Max 1 snapshot per 5 seconds
+        self._snapshot_in_progress: Dict[str, bool] = {}  # Track ongoing snapshot requests
+        self._ws_last_snapshot_time: Dict[str, float] = {}  # Track WebSocket snapshot times
+
         _log_with_timestamp(f"[COFINEX OBS] __init__ completed with ws_prefix={ws_prefix}")
 
     @classmethod
@@ -590,6 +600,11 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
             timestamp,
         )
         message_queue.put_nowait(snapshot_msg)
+
+        # Track WebSocket snapshot time for Option C safeguard
+        # This helps avoid redundant REST refreshes when WebSocket is sending snapshots
+        self._ws_last_snapshot_time[trading_pair] = time.time()
+
         # Reduced logging - only log periodically to avoid clutter
         # _log_with_timestamp(f"[COFINEX OBS] Snapshot message queued for {trading_pair}")
         # self.logger().info(f"Orderbook snapshot message queued for {trading_pair}")
@@ -718,8 +733,85 @@ class CofinexAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 message_queue.put_nowait(trade_message)
                 self.logger().info(f"[WS] Trade message parsed and queued: {trading_pair} @ {price} x {quantity} ({side}), TradeID={trade_id}")
 
+                # Option C: Trigger immediate snapshot refresh when trade is received
+                self._trigger_trade_based_snapshot_refresh(trading_pair, price, quantity)
+
         except Exception as e:
             self.logger().error(f"Error parsing trade message: {raw_message}, error: {e}", exc_info=True)
+
+    def _trigger_trade_based_snapshot_refresh(self, trading_pair: str, trade_price: str, trade_quantity: str):
+        """
+        Option C: Trigger immediate orderbook snapshot refresh when a trade is received.
+        Includes safeguards to prevent excessive API calls.
+
+        :param trading_pair: Trading pair that had a trade
+        :param trade_price: Price of the trade
+        :param trade_quantity: Quantity of the trade
+        """
+        if not trading_pair:
+            return
+
+        now = time.time()
+
+        # Safeguard 1: Debounce - prevent excessive refreshes
+        last_trigger = self._last_snapshot_trigger_time.get(trading_pair, 0)
+        if now - last_trigger < self._snapshot_refresh_debounce:
+            self.logger().debug(
+                f"[TRADE_REFRESH] Debounce: Skipping refresh for {trading_pair} "
+                f"(last trigger {now - last_trigger:.1f}s ago, debounce={self._snapshot_refresh_debounce}s)"
+            )
+            return
+
+        # Safeguard 2: Check if WebSocket snapshot is recent (within 2 seconds)
+        # If WebSocket already sent a snapshot, REST refresh is redundant
+        ws_snapshot_time = self._ws_last_snapshot_time.get(trading_pair, 0)
+        if ws_snapshot_time > now - 2.0:
+            self.logger().debug(
+                f"[TRADE_REFRESH] WebSocket snapshot recent for {trading_pair} "
+                f"({now - ws_snapshot_time:.1f}s ago), skipping REST refresh"
+            )
+            return
+
+        # Safeguard 3: Check if snapshot already in progress
+        if self._snapshot_in_progress.get(trading_pair, False):
+            self.logger().debug(
+                f"[TRADE_REFRESH] Snapshot already in progress for {trading_pair}, skipping duplicate"
+            )
+            return
+
+        # All safeguards passed - trigger refresh
+        self._last_snapshot_trigger_time[trading_pair] = now
+        asyncio.create_task(self._request_order_book_snapshots_for_pair(trading_pair))
+        self.logger().info(
+            f"[TRADE_REFRESH] Trade-triggered snapshot refresh for {trading_pair} "
+            f"(trade: {trade_quantity} @ {trade_price})"
+        )
+
+    async def _request_order_book_snapshots_for_pair(self, trading_pair: str):
+        """
+        Fetch orderbook snapshot for a single trading pair (for trade-triggered refresh).
+        This is called when a trade is received to keep the orderbook fresh.
+
+        :param trading_pair: Trading pair to fetch snapshot for
+        """
+        if self._snapshot_in_progress.get(trading_pair, False):
+            return
+
+        self._snapshot_in_progress[trading_pair] = True
+        snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
+
+        try:
+            self.logger().info(f"[TRADE_REFRESH] Fetching snapshot for {trading_pair}...")
+            snapshot_msg = await self._order_book_snapshot(trading_pair)
+            snapshot_queue.put_nowait(snapshot_msg)
+            self.logger().info(f"[TRADE_REFRESH] Snapshot fetched and queued for {trading_pair}")
+        except Exception as e:
+            self.logger().error(
+                f"[TRADE_REFRESH] Error fetching trade-triggered snapshot for {trading_pair}: {e}",
+                exc_info=True
+            )
+        finally:
+            self._snapshot_in_progress[trading_pair] = False
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:

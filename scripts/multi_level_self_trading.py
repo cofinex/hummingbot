@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import random
+import time
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -60,13 +61,17 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
 
     # Large level SELL configuration
     # Levels from large_level_sell_start to order_levels will use these settings
+    enable_large_level_spacing: bool = Field(
+        False,
+        description="Enable/disable large spacing for higher levels. When False, all levels use normal spacing."
+    )
     large_level_sell_start: int = Field(
         13,
-        description="First level to use large spacing (e.g., 13 means levels 13+ use large spacing). Set to 0 or > order_levels to disable."
+        description="First level to use large spacing (e.g., 13 means levels 13+ use large spacing). Only used when enable_large_level_spacing is True. Set to 0 or > order_levels to disable."
     )
     large_level_sell_spread_multiplier: Decimal = Field(
         Decimal("200"),
-        description="Multiplier for level_spread on large-level sell orders (e.g., 200 = 200x = 40% per level)"
+        description="Multiplier for level_spread on large-level sell orders (e.g., 200 = 200x). Only used when enable_large_level_spacing is True."
     )
     large_level_sell_min_usd: Decimal = Field(
         Decimal("5000"),
@@ -87,18 +92,22 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
         description="Level 1 sell offset from reference price (negative = below ref for overlap)"
     )
 
-    # Dynamic price shift from Bitget
+    # Dynamic price shift from Bitget (using 1-minute candlesticks)
     price_shift_enabled: bool = Field(
         True,
-        description="Enable dynamic price shift from Bitget change24h"
+        description="Enable dynamic price shift from Bitget BTC candlestick price movement"
     )
     bitget_api_url: str = Field(
-        "https://api.bitget.com/api/v2/spot/market/tickers",
-        description="Bitget API URL for ticker data"
+        "https://api.bitget.com/api/v2/spot/market",
+        description="Bitget API base URL for candlestick data"
     )
     bitget_symbol: str = Field(
         "BTCUSDT",
-        description="Bitget symbol to fetch change24h (e.g., BTCUSDT)"
+        description="Bitget symbol to track price movement (e.g., BTCUSDT)"
+    )
+    btc_candlestick_lookback_minutes: int = Field(
+        60,
+        description="Number of minutes to look back for BTC price movement (default: 60 = 1 hour)"
     )
     price_shift_update_interval: int = Field(
         60,
@@ -106,7 +115,7 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
     )
     price_shift_multiplier: Decimal = Field(
         Decimal("1.0"),
-        description="Multiplier for price shift (e.g., 1.0 = use change24h as-is, 2.0 = double it)"
+        description="Multiplier for price shift (e.g., 1.0 = use BTC change as-is, 2.0 = double it)"
     )
     price_shift_change_threshold: Decimal = Field(
         Decimal("0.1"),
@@ -122,9 +131,9 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
         True,
         description="Refresh orders after Level 1 self-trade fills (default: True to move market price)"
     )
-    refresh_on_level2_5_fill: bool = Field(
+    refresh_on_level1_above_fill: bool = Field(
         True,
-        description="Refresh orders after Levels 2+ fills (real market activity, default: True)"
+        description="Refresh orders after fills on levels above Level 1 (Levels 2-15, real market activity, default: True)"
     )
     cancel_orders_on_stop: bool = Field(
         False,
@@ -134,20 +143,20 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
 
 class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
     """
-    Multi-Level Self-Trading Strategy with Dynamic Price Shift from Bitget
+    Multi-Level Self-Trading Strategy with Dynamic Price Shift from Bitget BTC Candlesticks
 
     This strategy:
-    - Places 7 levels of buy/sell orders around a reference price
+    - Places multiple levels of buy/sell orders around a reference price
     - Level 1 orders overlap for self-trading (exchange-core matches them automatically)
-    - Levels 2-7 provide additional liquidity with 0.1% spread between levels
-    - Dynamically adjusts price shift based on Bitget's 24h price change (change24h)
+    - Levels 2+ provide additional liquidity with configurable spread between levels
+    - Dynamically adjusts price shift based on BTC's 1-minute candlestick price movement
     - Automatically refreshes orders after fills or periodically
 
     Key Features:
     - Self-trading: Level 1 buy and sell orders overlap, allowing exchange-core to match them
-    - Dynamic shift: Price shift follows Bitget's 24h price movement
-    - Multi-level: 7 levels provide depth and liquidity
-    - Auto-refresh: Orders refresh after fills or every 30 seconds
+    - Dynamic shift: Price shift follows BTC's short-term price movement (1-minute candlesticks)
+    - Multi-level: Configurable levels provide depth and liquidity
+    - Auto-refresh: Orders refresh after fills or on significant BTC price movement
 
     Designed for: exchange-core or exchanges that support self-trading
     """
@@ -196,24 +205,29 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         self.logger().info(f"Level 1 Order Value: ${config.level1_order_value_usd} USDT (amount calculated dynamically)")
         self.logger().info(f"Normal Buy Range: ${config.normal_buy_min_usd}-${config.normal_buy_max_usd} (all levels 2+)")
         self.logger().info(f"Normal Sell Range: ${config.normal_sell_min_usd}-${config.normal_sell_max_usd} (levels 2+ up to {config.large_level_sell_start - 1 if config.large_level_sell_start > 0 else config.order_levels})")  # noqa: E226
-        if config.large_level_sell_start > 0 and config.large_level_sell_start <= config.order_levels:
-            self.logger().info(f"Large Level Sell: Levels {config.large_level_sell_start}-{config.order_levels}")
+        if config.enable_large_level_spacing and config.large_level_sell_start > 0 and config.large_level_sell_start <= config.order_levels:
+            large_increment = config.large_level_sell_spread_multiplier * config.level_spread
+            self.logger().info(f"Large Level Sell: ENABLED - Levels {config.large_level_sell_start}-{config.order_levels}")
             self.logger().info(f"  - Range: ${config.large_level_sell_min_usd}-${config.large_level_sell_max_usd}")
-            self.logger().info(f"  - Spacing Multiplier: {config.large_level_sell_spread_multiplier}x ({config.large_level_sell_spread_multiplier * config.level_spread * 100:.1f}% per level)")
+            self.logger().info(f"  - Spacing Multiplier: {config.large_level_sell_spread_multiplier}x (${large_increment:.6f} per level)")
         else:
-            self.logger().info("Large Level Sell: Disabled")
+            if not config.enable_large_level_spacing:
+                self.logger().info("Large Level Sell: DISABLED (enable_large_level_spacing is False - all levels use normal spacing)")
+            else:
+                self.logger().info(f"Large Level Sell: DISABLED (invalid large_level_sell_start setting: {config.large_level_sell_start})")
         self.logger().info(f"Dynamic Price Shift: Enabled={config.price_shift_enabled}")
         if config.price_shift_enabled:
             self.logger().info(f"Bitget Symbol: {config.bitget_symbol}")
+            self.logger().info(f"Candlestick Lookback: {config.btc_candlestick_lookback_minutes} minutes")
             self.logger().info(f"Shift Update Interval: {config.price_shift_update_interval}s")
             self.logger().info(f"Shift Change Threshold: {config.price_shift_change_threshold}% (triggers refresh)")
-        self.logger().info(f"Fill Delay: {config.filled_order_delay}s | Refresh Level 1: {config.refresh_on_level1_fill} | Refresh Level 2+: {config.refresh_on_level2_5_fill}")
+        self.logger().info(f"Fill Delay: {config.filled_order_delay}s | Refresh Level 1: {config.refresh_on_level1_fill} | Refresh Above Level 1: {config.refresh_on_level1_above_fill}")
         self.logger().info(f"Price Type: {config.price_type} (use 'last' for self-trade price movement)")
         self.logger().info("Precision will be detected once connector is ready")
 
         # Fetch initial price shift
         if config.price_shift_enabled:
-            asyncio.create_task(self._fetch_bitget_change24h())
+            asyncio.create_task(self._fetch_bitget_candlestick_change())
 
         # For paper trading, fetch precision from API as fallback
         # For live trading, trading rules will be loaded via start_network() and detected automatically
@@ -549,7 +563,7 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         # Update price shift from Bitget if enabled
         if self.config.price_shift_enabled:
             if self.current_timestamp >= self.last_shift_update_timestamp + self.config.price_shift_update_interval:
-                asyncio.create_task(self._fetch_bitget_change24h())
+                asyncio.create_task(self._fetch_bitget_candlestick_change())
 
         # Check if we need to refresh (triggered by fill or Bitget shift change)
         if self.refresh_pending:
@@ -578,15 +592,35 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                 )
                 safe_ensure_future(self._refresh_orders())
 
-    async def _fetch_bitget_change24h(self):
+    async def _fetch_bitget_candlestick_change(self):
         """
-        Fetch change24h from Bitget API and update price shift
+        Fetch 1-minute candlesticks from Bitget API and calculate price change percentage
+        Compares the oldest vs newest candle to determine BTC price movement over the lookback period
 
-        Bitget API returns change24h as a decimal (e.g., 0.00309 = 0.309%)
-        We multiply by 100 to get percentage, then apply as price shift
+        Bitget candlestick format: [timestamp, open, high, low, close, volume, quote_volume]
+        - Index 0: timestamp (milliseconds)
+        - Index 1: open price
+        - Index 2: high price
+        - Index 3: low price
+        - Index 4: close price
+        - Index 5: volume
+        - Index 6: quote_volume
         """
         try:
-            url = f"{self.config.bitget_api_url}?symbol={self.config.bitget_symbol}"
+            # Calculate time window for lookback (e.g., last 60 minutes)
+            lookback_minutes = self.config.btc_candlestick_lookback_minutes
+            end_time_ms = int(time.time() * 1000)  # Current time in milliseconds
+            start_time_ms = end_time_ms - (lookback_minutes * 60 * 1000)  # N minutes ago
+
+            # Bitget candlestick endpoint
+            url = (
+                f"{self.config.bitget_api_url}/candles"
+                f"?symbol={self.config.bitget_symbol}"
+                f"&granularity=1min"
+                f"&startTime={start_time_ms}"
+                f"&endTime={end_time_ms}"
+                f"&limit={lookback_minutes}"
+            )
 
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
@@ -594,67 +628,97 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                         data = await response.json()
 
                         if data.get("code") == "00000" and data.get("data"):
-                            ticker_data = data["data"][0]
-                            change24h_raw = Decimal(str(ticker_data.get("change24h", "0.0")))
+                            candles = data["data"]
 
-                            # Convert to percentage: change24h * 100
-                            # Example: change24h = 0.00309 → percentage = 0.309%
-                            change24h_percentage = change24h_raw * Decimal("100")
+                            if len(candles) < 2:
+                                self.logger().warning(f"Not enough candles: {len(candles)}")
+                                return
 
-                            # Apply multiplier if configured
-                            self.bitget_change24h = change24h_raw
-                            new_shift = change24h_percentage * self.config.price_shift_multiplier
+                            # Candlestick format: [timestamp, open, high, low, close, volume, quote_volume]
+                            oldest_candle = candles[0]
+                            newest_candle = candles[-1]
 
-                            # Check if shift changed significantly (only if we have a previous value to compare)
-                            # Skip check on very first update when previous_price_shift is still 0.0
-                            if self.previous_price_shift != Decimal("0.0"):
-                                shift_change = abs(new_shift - self.previous_price_shift)
-                                if shift_change >= self.config.price_shift_change_threshold:
-                                    self.logger().info(
-                                        f"Bitget shift changed significantly: {self.previous_price_shift:.4f}% → {new_shift:.4f}% "
-                                        f"(change: {shift_change:.4f}%) - Triggering refresh"
-                                    )
-                                    # Trigger refresh (unless fill-based refresh is pending)
-                                    if not self.refresh_pending:
-                                        self.refresh_pending = True
-                                        self.last_fill_timestamp = self.current_timestamp
+                            # Extract prices
+                            oldest_open = Decimal(str(oldest_candle[1]))  # open price
+                            newest_close = Decimal(str(newest_candle[4]))  # close price
+
+                            # Calculate price change percentage
+                            # Change = (newest_close - oldest_open) / oldest_open * 100
+                            if oldest_open > 0:
+                                price_change_percent = ((newest_close - oldest_open) / oldest_open) * Decimal("100")
+
+                                # Apply multiplier if configured
+                                new_shift = price_change_percent * self.config.price_shift_multiplier
+
+                                # Store the price change for reference
+                                self.bitget_change24h = price_change_percent
+
+                                # Log the price movement
+                                self.logger().info(
+                                    f"BTC price movement ({lookback_minutes}m): "
+                                    f"{oldest_open:.2f} → {newest_close:.2f} "
+                                    f"({price_change_percent:.4f}%)"
+                                )
+
+                                # Check if shift changed significantly
+                                if self.previous_price_shift != Decimal("0.0"):
+                                    shift_change = abs(new_shift - self.previous_price_shift)
+                                    if shift_change >= self.config.price_shift_change_threshold:
                                         self.logger().info(
-                                            f"Bitget shift change detected, will refresh orders in "
+                                            f"BTC shift changed significantly: {self.previous_price_shift:.4f}% → {new_shift:.4f}% "
+                                            f"(change: {shift_change:.4f}%) - Triggering refresh"
+                                        )
+                                        self.refresh_pending = True
+                                        # Only update timestamp if not already set, or if this would trigger an earlier refresh
+                                        # This ensures the earliest trigger (BTC shift or fill) wins
+                                        if (
+                                            self.last_fill_timestamp == 0
+                                            or self.current_timestamp < self.last_fill_timestamp
+                                        ):
+                                            self.last_fill_timestamp = self.current_timestamp
+                                        self.logger().info(
+                                            f"BTC shift change detected, will refresh orders in "
                                             f"{self.config.filled_order_delay}s"
                                         )
 
-                            # Update both current and previous shift (previous is used for next comparison)
-                            self.current_price_shift = new_shift
-                            self.previous_price_shift = new_shift
-                            self.last_shift_update_timestamp = self.current_timestamp
+                                # Update shifts
+                                self.current_price_shift = new_shift
+                                self.previous_price_shift = new_shift
+                                self.last_shift_update_timestamp = self.current_timestamp
 
-                            self.logger().info(
-                                f"Bitget change24h updated: {change24h_raw} → {change24h_percentage:.4f}% "
-                                f"(Shift: {self.current_price_shift:.4f}%)"
-                            )
+                                self.logger().info(
+                                    f"BTC candlestick shift updated: {price_change_percent:.4f}% "
+                                    f"(Applied shift: {self.current_price_shift:.4f}%)"
+                                )
+                            else:
+                                self.logger().warning("Invalid candle data: oldest_open is zero")
                         else:
                             self.logger().warning(f"Bitget API returned error: {data.get('msg', 'Unknown')}")
                     else:
                         self.logger().warning(f"Bitget API request failed: HTTP {response.status}")
 
         except asyncio.TimeoutError:
-            self.logger().warning("Bitget API request timeout")
+            self.logger().warning("Bitget candlestick API request timeout")
         except Exception as e:
-            self.logger().error(f"Error fetching Bitget change24h: {e}")
+            self.logger().error(f"Error fetching Bitget candlesticks: {e}", exc_info=True)
 
     async def _refresh_orders(self):
         """
-        Cancel existing orders and place new multi-level orders.
-        Waits for all cancellations to complete before placing new orders.
+        Smart refresh: Only cancel orders that need to change (different price/amount).
+        Places new orders first, then cancels only orders that don't match the new proposal.
+        This keeps the order book populated and minimizes disruption.
         """
-        # Cancel all existing orders and wait for completion
-        await self._cancel_all_orders()
+        # Get snapshot of current orders BEFORE creating proposal
+        old_orders = self.get_active_orders(connector_name=self.config.exchange)
 
         # Create multi-level order proposal with price shift
         proposal: List[OrderCandidate] = self._create_multi_level_proposal()
 
         if not proposal:
             self.logger().warning("No orders to place - check price source and balances")
+            # Cancel old orders if we can't place new ones
+            if old_orders:
+                await self._cancel_all_orders()
             return
 
         # Log current balances for debugging
@@ -674,14 +738,113 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         # Adjust proposal based on available budget
         proposal_adjusted: List[OrderCandidate] = self._adjust_proposal_to_budget(proposal)
 
-        # Place orders with 10ms delay between each to avoid Exchange-Core duplicate order ID issues
-        await self._place_orders(proposal_adjusted)
+        if not proposal_adjusted:
+            self.logger().warning("No orders to place after budget adjustment")
+            if old_orders:
+                await self._cancel_all_orders()
+            return
+
+        # Match old orders with new proposal to determine which to keep/cancel
+        orders_to_keep = []
+        orders_to_cancel = []
+        matched_new_orders = set()  # Track which new orders matched old ones
+
+        # Price and amount tolerance for matching
+        price_tolerance_pct = Decimal("0.001")  # 0.1% price difference tolerance
+        amount_tolerance_pct = Decimal("0.01")  # 1% amount difference tolerance
+
+        for old_order in old_orders:
+            # Only consider orders for the same trading pair
+            if old_order.trading_pair != self.config.trading_pair:
+                orders_to_cancel.append(old_order)
+                continue
+
+            # Find matching new order (same side, similar price/amount)
+            matched = False
+            best_match_idx = -1
+
+            for idx, new_order in enumerate(proposal_adjusted):
+                # Skip if this new order already matched
+                if idx in matched_new_orders:
+                    continue
+
+                # Check side match
+                old_is_buy = old_order.is_buy
+                new_is_buy = (new_order.order_side == TradeType.BUY)
+
+                if old_is_buy != new_is_buy:
+                    continue  # Different sides, can't match
+
+                # Check price match (with tolerance)
+                old_price = Decimal(str(old_order.price))
+                new_price = Decimal(str(new_order.price))
+                price_diff_pct = abs(old_price - new_price) / old_price if old_price > 0 else Decimal("1")
+
+                if price_diff_pct > price_tolerance_pct:
+                    continue  # Price too different
+
+                # Check amount match (with tolerance)
+                old_quantity = Decimal(str(old_order.quantity))
+                new_amount = Decimal(str(new_order.amount))
+                amount_diff_pct = abs(old_quantity - new_amount) / old_quantity if old_quantity > 0 else Decimal("1")
+
+                if amount_diff_pct > amount_tolerance_pct:
+                    continue  # Amount too different
+
+                # Found a match!
+                matched = True
+                best_match_idx = idx
+                break
+
+            if matched:
+                orders_to_keep.append(old_order)
+                matched_new_orders.add(best_match_idx)
+                self.logger().debug(
+                    f"Keeping order {old_order.client_order_id}: "
+                    f"{'BUY' if old_order.is_buy else 'SELL'} "
+                    f"{old_order.quantity:.{self.amount_precision}f} @ {old_order.price:.{self.price_precision}f} "
+                    f"(matches new order)"
+                )
+            else:
+                orders_to_cancel.append(old_order)
+                self.logger().debug(
+                    f"Will cancel order {old_order.client_order_id}: "
+                    f"{'BUY' if old_order.is_buy else 'SELL'} "
+                    f"{old_order.quantity:.{self.amount_precision}f} @ {old_order.price:.{self.price_precision}f} "
+                    f"(no match in new proposal)"
+                )
+
+        # Log matching summary
+        new_orders_to_place = [o for idx, o in enumerate(proposal_adjusted) if idx not in matched_new_orders]
+
+        self.logger().info(
+            f"Smart refresh: Keeping {len(orders_to_keep)} matching orders, "
+            f"cancelling {len(orders_to_cancel)} old orders, "
+            f"placing {len(new_orders_to_place)} new orders"
+        )
+
+        # PLACE NEW ORDERS FIRST (keeps order book populated)
+        if new_orders_to_place:
+            self.logger().info(f"Placing {len(new_orders_to_place)} new orders first...")
+            await self._place_orders(new_orders_to_place)
+
+        # THEN cancel only orders that need to change
+        if orders_to_cancel:
+            self.logger().info(f"Cancelling {len(orders_to_cancel)} old orders that don't match new proposal...")
+            for order in orders_to_cancel:
+                try:
+                    self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+                    await asyncio.sleep(0.01)  # Small delay between cancellations
+                except Exception as e:
+                    self.logger().error(f"Error cancelling order {order.client_order_id}: {e}")
+        else:
+            self.logger().info("All existing orders match new proposal - no cancellations needed")
 
         # Log order placement summary
         buy_orders = [o for o in proposal_adjusted if o.order_side == TradeType.BUY]
         sell_orders = [o for o in proposal_adjusted if o.order_side == TradeType.SELL]
         self.logger().info(
-            f"Placed {len(buy_orders)} buy orders and {len(sell_orders)} sell orders "
+            f"Order refresh complete: {len(buy_orders)} buy orders and {len(sell_orders)} sell orders "
             f"across {self.config.order_levels} levels "
             f"(Price shift: {self.current_price_shift:.4f}% from Bitget change24h)"
         )
@@ -732,7 +895,7 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                 if not hasattr(self, '_last_logged_base_price') or abs(base_price - self._last_logged_base_price) > Decimal("0.0001"):
                     self.logger().info(
                         f"Reference price update: Base={base_price:.{self.price_precision}f}, "
-                        f"Bitget change24h={self.bitget_change24h:.6f}, "
+                        f"BTC change ({self.config.btc_candlestick_lookback_minutes}m)={self.bitget_change24h:.4f}%, "
                         f"Shift={self.current_price_shift:.4f}%, "
                         f"Shifted={shifted_price:.{self.price_precision}f}"
                     )
@@ -882,7 +1045,9 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         # Levels 2+: Config-driven order amounts and spacing
         # Calculate relative to reference price (not Level 1) to maintain proper spacing
         # Level 1 uses special offsets for self-trading overlap, but Levels 2+ use config-driven spacing
-        large_spacing_enabled = (self.config.large_level_sell_start > 0 and
+        # Check if large spacing is enabled (both the switch and the start level must be valid)
+        large_spacing_enabled = (self.config.enable_large_level_spacing and
+                                 self.config.large_level_sell_start > 0 and
                                  self.config.large_level_sell_start <= self.config.order_levels)
 
         for level in range(2, self.config.order_levels + 1):
@@ -890,36 +1055,44 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
             use_large_spacing_sell = large_spacing_enabled and level >= self.config.large_level_sell_start
 
             # Calculate price spacing for SELL orders
+            # NEW: Incremental spacing - each level is level_spread away from previous level (not cumulative from reference)
             if use_large_spacing_sell:
-                # Large spacing: additive from previous level (each level = previous level + increment)
+                # Large spacing: additive from previous level (each level = previous level + large increment)
                 prev_level = level - 1
-                # Calculate previous level's sell price
+                # Calculate previous level's sell price incrementally
                 if prev_level < self.config.large_level_sell_start:
-                    # Previous level uses normal spacing
-                    prev_level_offset = (prev_level - 1) * self.config.level_spread
-                    prev_level_sell_price = ref_price * (Decimal("1") + prev_level_offset)
+                    # Previous level uses normal spacing - calculate incrementally from Level 1
+                    prev_level_sell_price = level1_sell_price
+                    for prev_lvl in range(2, prev_level + 1):
+                        prev_level_sell_price = prev_level_sell_price + self.config.level_spread
                 else:
-                    # Previous level is also a large level - calculate it recursively
-                    # For any large level M: calculate all previous large levels
-                    first_large_level_offset = (self.config.large_level_sell_start - 1) * self.config.level_spread
-                    first_large_level_normal_price = ref_price * (Decimal("1") + first_large_level_offset)
-                    large_spread_increment = self.config.large_level_sell_spread_multiplier * self.config.level_spread * ref_price
-                    first_large_level_price = first_large_level_normal_price + large_spread_increment
-                    # Previous level's price: first large level + (prev_level - large_level_sell_start) increments
+                    # Previous level is also a large level - calculate incrementally
+                    # First, get price at the last normal level (large_level_sell_start - 1)
+                    first_large_level_base_price = level1_sell_price
+                    for prev_lvl in range(2, self.config.large_level_sell_start):
+                        first_large_level_base_price = first_large_level_base_price + self.config.level_spread
+                    # Add large increment for first large level
+                    large_spread_increment = self.config.large_level_sell_spread_multiplier * self.config.level_spread
+                    first_large_level_price = first_large_level_base_price + large_spread_increment
+                    # Previous level's price: first large level + (prev_level - large_level_sell_start) large increments
                     num_prev_increments = prev_level - self.config.large_level_sell_start
                     prev_level_sell_price = first_large_level_price + (num_prev_increments * large_spread_increment)
 
-                # Current level: previous level + increment
-                large_spread_increment = self.config.large_level_sell_spread_multiplier * self.config.level_spread * ref_price
+                # Current level: previous level + large increment
+                large_spread_increment = self.config.large_level_sell_spread_multiplier * self.config.level_spread
                 level_sell_price = prev_level_sell_price + large_spread_increment
             else:
-                # Normal spacing: cumulative offset from reference price
-                level_offset = (level - 1) * self.config.level_spread
-                level_sell_price = ref_price * (Decimal("1") + level_offset)
+                # Normal spacing: incremental from previous level (each level = previous level + level_spread)
+                # Calculate incrementally from Level 1
+                level_sell_price = level1_sell_price
+                for prev_lvl in range(2, level + 1):
+                    level_sell_price = level_sell_price + self.config.level_spread
 
-            # Buy orders always use normal spacing (go below reference price)
-            level_offset = (level - 1) * self.config.level_spread
-            level_buy_price = ref_price * (Decimal("1") - level_offset)
+            # Buy orders: incremental from previous level (each level = previous level - level_spread, going below)
+            # Calculate incrementally from Level 1
+            level_buy_price = level1_buy_price
+            for prev_lvl in range(2, level + 1):
+                level_buy_price = level_buy_price - self.config.level_spread
 
             # Quantize prices
             try:
@@ -1137,6 +1310,14 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
             # Only refresh if configured to do so
             if self.config.refresh_on_level1_fill:
                 self.refresh_pending = True
+                # Only update timestamp if not already set, or if this fill would trigger an earlier refresh
+                # This prevents fills from overwriting an earlier BTC shift change refresh
+                # We keep the EARLIEST timestamp so refresh happens as soon as possible
+                if (
+                    self.last_fill_timestamp == 0
+                    or self.current_timestamp < self.last_fill_timestamp
+                ):
+                    self.last_fill_timestamp = self.current_timestamp
                 self.logger().info(
                     f"Level 1 fill - refresh_on_level1_fill=True, will refresh in {self.config.filled_order_delay}s"
                 )
@@ -1146,14 +1327,21 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
                 )
         else:
             # Level 2+ fill (real market activity)
-            if self.config.refresh_on_level2_5_fill:
+            if self.config.refresh_on_level1_above_fill:
                 self.refresh_pending = True
+                # Only update timestamp if not already set, or if this fill would trigger an earlier refresh
+                # This prevents fills from overwriting an earlier BTC shift change refresh
+                if (
+                    self.last_fill_timestamp == 0
+                    or self.current_timestamp < self.last_fill_timestamp
+                ):
+                    self.last_fill_timestamp = self.current_timestamp
                 self.logger().info(
-                    f"Level 2+ fill (real market activity) - will refresh in {self.config.filled_order_delay}s"
+                    f"Level above Level 1 fill (real market activity) - will refresh in {self.config.filled_order_delay}s"
                 )
             else:
                 self.logger().info(
-                    "Level 2+ fill - refresh_on_level2_5_fill=False, NOT refreshing"
+                    "Level above Level 1 fill - refresh_on_level1_above_fill=False, NOT refreshing"
                 )
 
         msg = (
@@ -1204,9 +1392,9 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
             f"  Base Mid Price: {base_mid_str}",
             f"  Reference Price (shifted): {ref_price_str}",
             "",
-            "  Dynamic Price Shift (Bitget):",
+            "  Dynamic Price Shift (Bitget BTC Candlesticks):",
             f"    Enabled: {self.config.price_shift_enabled}",
-            f"    Bitget change24h: {self.bitget_change24h}",
+            f"    BTC Price Change ({self.config.btc_candlestick_lookback_minutes}m): {self.bitget_change24h:.4f}%",
             f"    Current Shift: {self.current_price_shift:.4f}%",
             f"    Last Update: {self.current_timestamp - self.last_shift_update_timestamp:.0f}s ago",
             "",

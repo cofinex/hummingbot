@@ -24,6 +24,11 @@ from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
 
+try:
+    from hummingbot.core.rate_oracle.sources.cofinex_rate_source import CofinexRateSource
+except ImportError:
+    CofinexRateSource = None
+
 RATE_ORACLE_SOURCES = {
     "binance": BinanceRateSource,
     "coin_gecko": CoinGeckoRateSource,
@@ -38,6 +43,9 @@ RATE_ORACLE_SOURCES = {
     "derive": DeriveRateSource,
     "mexc": MexcRateSource,
 }
+
+if CofinexRateSource is not None:
+    RATE_ORACLE_SOURCES["cofinex"] = CofinexRateSource
 
 
 class RateOracle(NetworkBase):

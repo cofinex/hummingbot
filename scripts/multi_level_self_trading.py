@@ -126,6 +126,14 @@ class MultiLevelSelfTradingConfig(BaseClientModel):
     order_refresh_time: int = Field(300, description="Time in seconds to refresh orders if no fills")
     filled_order_delay: int = Field(30, description="Delay in seconds after fill before placing new orders (balanced: 30s)")
     price_type: str = Field("last", description="Price source: 'mid' or 'last' (use 'last' for self-trade price movement)")
+    use_initial_price: bool = Field(
+        False,
+        description="Use configured initial_price instead of exchange price (default: False)"
+    )
+    initial_price: Optional[Decimal] = Field(
+        None,
+        description="Initial reference price to use when use_initial_price is True (if None, uses exchange price)"
+    )
     enable_self_trading: bool = Field(True, description="Enable self-trading on level 1")
     refresh_on_level1_fill: bool = Field(
         True,
@@ -864,21 +872,28 @@ class MultiLevelSelfTradingStrategy(ScriptStrategyBase):
         - Apply as shift: reference = base_price * (1 + 0.309/100)
 
         Note: If LastTrade price is not available (e.g., no trades yet), falls back to MidPrice
+        If use_initial_price is True and initial_price is set, uses that as base price instead of exchange price
         """
         connector = self.connectors[self.config.exchange]
 
         try:
-            base_price = connector.get_price_by_type(self.config.trading_pair, self.price_source)
+            # Check if we should use configured initial price
+            if self.config.use_initial_price and self.config.initial_price is not None:
+                base_price = self.config.initial_price
+                self.logger().info(f"Using configured initial price: {base_price:.{self.price_precision}f}")
+            else:
+                # Get price from exchange
+                base_price = connector.get_price_by_type(self.config.trading_pair, self.price_source)
 
-            # If LastTrade price is not available from connector (e.g., paper trading doesn't track it)
-            # First try our internally tracked last trade price, then fall back to MidPrice
-            if (base_price is None or base_price.is_nan()) and self.price_source == PriceType.LastTrade:
-                if self._last_trade_price is not None:
-                    self.logger().debug(f"Using internally tracked last trade price: {self._last_trade_price:.{self.price_precision}f}")
-                    base_price = self._last_trade_price
-                else:
-                    self.logger().info(f"Last trade price not available (no fills yet), falling back to mid price for {self.config.trading_pair}")
-                    base_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
+                # If LastTrade price is not available from connector (e.g., paper trading doesn't track it)
+                # First try our internally tracked last trade price, then fall back to MidPrice
+                if (base_price is None or base_price.is_nan()) and self.price_source == PriceType.LastTrade:
+                    if self._last_trade_price is not None:
+                        self.logger().debug(f"Using internally tracked last trade price: {self._last_trade_price:.{self.price_precision}f}")
+                        base_price = self._last_trade_price
+                    else:
+                        self.logger().info(f"Last trade price not available (no fills yet), falling back to mid price for {self.config.trading_pair}")
+                        base_price = connector.get_price_by_type(self.config.trading_pair, PriceType.MidPrice)
 
             if base_price is None or base_price.is_nan():
                 self.logger().warning(f"Could not get price for {self.config.trading_pair} (tried {self.price_source})")

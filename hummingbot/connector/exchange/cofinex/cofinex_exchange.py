@@ -626,25 +626,23 @@ class CofinexExchange(ExchangePyBase):
         """Update account balances from exchange"""
         try:
             rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-
-            # Step 1: Sync balances first (POST /balances/sync)
             rest_api_base_url = getattr(self, "_rest_api_base_url", None)
-            sync_url = web_utils.private_rest_url(
-                path_url=CONSTANTS.BALANCES_SYNC_PATH_URL,
-                domain=self._domain,
-                rest_api_base_url=rest_api_base_url,
-            )
 
-            try:
-                await rest_assistant.execute_request(
-                    url=sync_url,
-                    method=RESTMethod.POST,
-                    is_auth_required=True,
-                    throttler_limit_id=CONSTANTS.BALANCES_SYNC_PATH_URL,
-                )
-                # Don't process response - just trigger sync
-            except Exception as e:
-                self.logger().warning(f"Error syncing balances: {e}")
+            # Step 1: Sync balances - DISABLED: sync is called once at script start only
+            # try:
+            #     sync_url = web_utils.private_rest_url(
+            #         path_url=CONSTANTS.BALANCES_SYNC_PATH_URL,
+            #         domain=self._domain,
+            #         rest_api_base_url=rest_api_base_url,
+            #     )
+            #     await rest_assistant.execute_request(
+            #         url=sync_url,
+            #         method=RESTMethod.POST,
+            #         is_auth_required=True,
+            #         throttler_limit_id=CONSTANTS.BALANCES_SYNC_PATH_URL,
+            #     )
+            # except Exception as e:
+            #     self.logger().warning(f"Error syncing balances: {e}")
 
             # Step 2: Get balances (GET /balances)
             balances_url = web_utils.private_rest_url(

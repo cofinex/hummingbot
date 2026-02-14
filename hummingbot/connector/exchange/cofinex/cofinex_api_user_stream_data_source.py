@@ -105,6 +105,9 @@ class CofinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().info(f"listen_for_user_stream called with output queue: {output}, auth: {self._auth}, api_factory: {self._api_factory}")
             self.logger().info("Starting REST-based user stream polling...")
 
+            # One-time sync at script start - do not call sync on every poll
+            await self._sync_balances_once()
+
             while True:
                 try:
                     current_time = self._time()
@@ -137,13 +140,35 @@ class CofinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().error(f"FATAL ERROR in listen_for_user_stream: {e}", exc_info=True)
             raise
 
+    async def _sync_balances_once(self):
+        """
+        Call POST /balances/sync once at script start.
+        Do not call on every poll - sync is expensive.
+        """
+        try:
+            rest_assistant = await self._api_factory.get_rest_assistant()
+            rest_api_base_url = getattr(self._connector, "_rest_api_base_url", None) if self._connector else None
+            sync_url = web_utils.private_rest_url(
+                path_url=CONSTANTS.BALANCES_SYNC_PATH_URL,
+                domain=self._domain,
+                rest_api_base_url=rest_api_base_url,
+            )
+            await rest_assistant.execute_request(
+                url=sync_url,
+                method=RESTMethod.POST,
+                data={},  # Send empty JSON body - user_id is extracted from token for regular users
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.BALANCES_SYNC_PATH_URL,
+            )
+            self.logger().info("[USER_STREAM] One-time balance sync completed at start")
+        except Exception as e:
+            self.logger().warning(f"[USER_STREAM] Error during one-time balance sync: {e}")
+
     async def _poll_balances(self, output: asyncio.Queue):
         """
         Poll account balances and detect changes.
 
-        First calls POST /balances/sync to sync balances, then GET /balances to retrieve them.
-
-        :param output: Queue to put balance update messages
+        Only GET /balances - sync is called once at script start, not on every poll.
         """
         try:
             start_ts = self._time()
@@ -152,24 +177,22 @@ class CofinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
             rest_assistant = await self._api_factory.get_rest_assistant()
             rest_api_base_url = getattr(self._connector, "_rest_api_base_url", None) if self._connector else None
 
-            # Step 1: Sync balances first (POST /balances/sync)
-            # The endpoint expects a JSON body (BalanceSyncRequest), even if empty for regular users
-            try:
-                sync_url = web_utils.private_rest_url(
-                    path_url=CONSTANTS.BALANCES_SYNC_PATH_URL,
-                    domain=self._domain,
-                    rest_api_base_url=rest_api_base_url,
-                )
-                await rest_assistant.execute_request(
-                    url=sync_url,
-                    method=RESTMethod.POST,
-                    data={},  # Send empty JSON body - user_id is extracted from token for regular users
-                    is_auth_required=True,
-                    throttler_limit_id=CONSTANTS.BALANCES_SYNC_PATH_URL,
-                )
-                # Don't process response - just trigger sync
-            except Exception as e:
-                self.logger().warning(f"[USER_STREAM] Error syncing balances: {e}")
+            # Step 1: Sync balances - DISABLED: we call sync once at script start only
+            # try:
+            #     sync_url = web_utils.private_rest_url(
+            #         path_url=CONSTANTS.BALANCES_SYNC_PATH_URL,
+            #         domain=self._domain,
+            #         rest_api_base_url=rest_api_base_url,
+            #     )
+            #     await rest_assistant.execute_request(
+            #         url=sync_url,
+            #         method=RESTMethod.POST,
+            #         data={},  # Send empty JSON body - user_id is extracted from token for regular users
+            #         is_auth_required=True,
+            #         throttler_limit_id=CONSTANTS.BALANCES_SYNC_PATH_URL,
+            #     )
+            # except Exception as e:
+            #     self.logger().warning(f"[USER_STREAM] Error syncing balances: {e}")
 
             # Step 2: Get balances (GET /balances)
             balances_url = web_utils.private_rest_url(

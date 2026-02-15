@@ -27,11 +27,11 @@ MARKET_DATA_BASE_URL = {
 }
 
 # Trade Engine API (private endpoints)
-# Production default: https://tradeapi1.cofinex.io
+# Production: https://tradeapi1.cofinex.io (used for /time, orders, balances)
 # Can be overridden via config (cofinex_rest_api_base_url) for local testing
 BASE_PATH_URL = {
-    "main": "http://localhost:8001",
-    # "main": "https://tradeapi1.cofinex.io",
+    "main": "https://tradeapi1.cofinex.io",
+    # "main": "http://localhost:8001",  # For local exchange-core testing
     # Add testnet if available
     # "testnet": "https://api-testnet.cofinex.com",
 }

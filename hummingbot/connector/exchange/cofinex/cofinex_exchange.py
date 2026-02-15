@@ -2114,29 +2114,13 @@ class CofinexExchange(ExchangePyBase):
 
     async def _status_polling_loop(self):
         """
-        Main status polling loop
+        Main status polling loop.
 
-        TODO: Implement status polling:
-        1. Poll account balances
-        2. Poll open orders
-        3. Poll order book updates
-        4. Handle network errors
-        5. Implement rate limiting
+        Uses base implementation to:
+        - Update time synchronizer from Cofinex server (GET /time)
+        - Poll balances and order status (backup to user stream)
         """
-        while True:
-            try:
-                # TODO: Implement actual status polling
-                # This should poll:
-                # - Account balances
-                # - Open orders
-                # - Order book updates
-                # - System status
-
-                await asyncio.sleep(1)  # Poll every second
-
-            except Exception as e:
-                self.logger().error(f"Error in status polling: {e}")
-                await asyncio.sleep(5)  # Wait longer on error
+        await super()._status_polling_loop()
 
     # =============================================================================
     # API REQUEST HELPERS
